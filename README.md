@@ -8,7 +8,6 @@
 | 文档 | 主题 | 一句话 |
 |---|---|---|
 | [proxy-runbook.md](proxy-runbook.md) | 科学上网 | VLESS+REALITY 服务端搭建 + v2rayA 客户端 TProxy 分流 / DNS 分流 / 崩溃兜底，含验证与排错速查表 |
-| [demo-note.md](demo-note.md) | 演示 | 脚本自测用，随后删除 |
 <!-- 新增文档后在上面加一行 -->
 
 ## 🧭 使用方式
