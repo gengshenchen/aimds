@@ -8,6 +8,7 @@
 | 文档 | 主题 | 一句话 |
 |---|---|---|
 | [proxy-runbook.md](proxy-runbook.md) | 科学上网 | VLESS+REALITY 服务端搭建 + v2rayA 客户端 TProxy 分流 / DNS 分流 / 崩溃兜底，含验证与排错速查表 |
+| [tailscale-remote-runbook.md](tailscale-remote-runbook.md) | 远程桌面 | Tailscale + v2rayA 共存跑 NoMachine 远程：避免 Tailscale 被代理绕路、直连/中继判读、节点失败看门狗兜底 |
 <!-- 新增文档后在上面加一行 -->
 
 ## 🧭 使用方式
