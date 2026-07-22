@@ -17,6 +17,8 @@
 
 适用：一台干净的 Ubuntu VPS（root）。若上面有旧的 3x-ui/xray，先卸载（见 1.0）。
 
+> 💥 **被入侵后重建**（如发现 `kswapd0` 等矿马、CPU 99%、SSH 都握不上手）：别手动清木马（后门难清干净），**直接在服务商后台重装系统**成干净镜像，再照本手册走一遍，最后**务必做 1.7 加固**。本手册用纯 Xray、**不装公网面板**，从根上去掉被打的入口。
+
 ### 1.0（可选）清理旧代理
 ```bash
 systemctl stop x-ui 2>/dev/null; systemctl disable x-ui 2>/dev/null
@@ -103,6 +105,34 @@ pkill -f selftest.json; rm -f /tmp/selftest.json /tmp/selftest.log
 ```
 
 > ⚠️ 若客户端连不上但自测通过 → 多半是**客户端内核太旧**连不上过新的 Xray，升级客户端；或把服务端 Xray 换成与客户端同代的稳定版。
+
+### 1.7 服务器加固（重装后必做——这次被黑就是缺这步）
+```bash
+# a. 先放入你本机的 SSH 公钥（在本机 ssh-keygen 生成后，把 .pub 内容填进来）
+mkdir -p ~/.ssh && chmod 700 ~/.ssh
+echo '<粘贴你的 SSH 公钥 ssh-ed25519 AAAA...>' >> ~/.ssh/authorized_keys
+chmod 600 ~/.ssh/authorized_keys
+
+# b. 关掉密码登录（★务必先另开一个终端确认密钥能登进来，再执行这步★）
+sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
+sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
+systemctl restart ssh || systemctl restart sshd
+
+# c. 防火墙：默认拒绝入站，只放行 SSH + 节点端口
+apt-get update && apt-get install -y ufw
+ufw default deny incoming; ufw default allow outgoing
+ufw allow 22/tcp          # 若改了 SSH 端口，换成新端口
+ufw allow 443/tcp         # REALITY 节点
+ufw --force enable
+
+# d. fail2ban 挡 SSH 暴力破解
+apt-get install -y fail2ban && systemctl enable --now fail2ban
+
+# e. 系统更新
+apt-get update && apt-get -y upgrade
+```
+> **绝不再装 3x-ui 等公网面板**——本手册用纯 Xray，没有面板就没有面板入口（本次入侵正是暴露的 3x-ui 面板被打）。若确实要面板，务必绑定 `127.0.0.1` 后用 SSH 隧道访问，绝不 `0.0.0.0` 对全网裸奔。
+> 验证加固：`ss -tlnp | grep -vE '127.0.0.1|::1'` 应只看到 22 和 443 在对外监听。
 
 ---
 
@@ -199,6 +229,7 @@ sudo systemctl start v2raya
 | curl gstatic 返回 404 | 请求根路径无内容，**连接是成功的** | 正常，用 `/generate_204` 测会返回 204 |
 | 代理挂了整机断网（含国内） | TProxy 规则残留、进程没了 | 第 2.6 兜底；急救 `sudo systemctl restart/stop v2raya` |
 | 客户端连不上但服务端自测(1.6)通过 | 客户端内核太旧 | 升级客户端；或服务端 Xray 降到同代稳定版 |
+| VPS CPU 99%、进程名像 `kswapd0` 但 **RES≠0** 或 `/proc/<pid>/exe` 指向 `/etc`、`/tmp`、`/dev/shm` | **挖矿木马冒充内核线程**，多因暴露的 3x-ui 面板被入侵 | 真内核线程 RES=0、exe 指不到文件、PPID=2；反之即木马。备份参数→重装系统→按 1.7 加固，别装公网面板 |
 
 ---
 
