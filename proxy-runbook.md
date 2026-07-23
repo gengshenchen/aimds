@@ -239,3 +239,101 @@ sudo systemctl start v2raya
 - REALITY 端口固定 **443**，SNI `www.tesla.com`。
 - 凭据（UUID/PrivateKey/PublicKey/shortId）**每台服务器用 `xray x25519`/`uuid`/`openssl rand` 重新生成**，切勿跨机复用。
 - 国内 DNS：`223.5.5.5`/`https://dns.alidns.com/dns-query`、`119.29.29.29`；国外 DNS：`https://1.1.1.1/dns-query`。
+
+---
+
+# 第五部分：线路诊断与「精品线路」防骗（重要）
+
+> 场景：节点能连、能上网，但**看 YouTube/下载龟速**。多数不是配置问题，而是**跨境线路**被超售或被虚假宣传。本节给出一套定位方法，10 分钟判断「机器带宽真假 / 瓶颈在哪 / 商家有没有骗你」。
+
+## 5.1 三段测速法：定位瓶颈到底在哪
+
+关键思路：**分别测「本机→VPS→国际」和「VPS本地→国际」**，一对比就知道瓶颈是不是在跨境段。
+
+```bash
+# ① 本机经代理测速（走 VPS 出海的真实体验）
+curl -s -o /dev/null -w "经代理: %{speed_download} B/s\n" --max-time 30 \
+  "https://speed.cloudflare.com/__down?bytes=10000000"
+
+# ② SSH 到 VPS，测 VPS 本地到国际（绕开中国这一段）
+ssh -p <port> root@<vps-ip> \
+  'curl -s -o /dev/null -w "VPS本地: %{speed_download} B/s\n" --max-time 30 \
+   "https://speed.cloudflare.com/__down?bytes=50000000"'
+```
+
+判读：
+
+| ① 经代理 | ② VPS 本地 | 结论 |
+|---|---|---|
+| 慢（如 0.1 Mbps） | 快（如 47 Mbps） | **瓶颈在跨境链路**：线路超售 / 被虚假宣传 / 晚高峰拥塞。改配置无用 |
+| 慢 | 也慢 | **VPS 整体被限速**：找商家，可能是套餐限速或母鸡超售 |
+| 快 | 快 | 线路没问题，卡是客户端本地（分流/DNS/网卡）问题 |
+
+> 真实案例（LisaHost 192.220.22.76，2026-07）：经代理 **0.12 Mbps**，VPS 本地 **47 Mbps** → 坐实瓶颈在跨境段。
+
+## 5.2 用 mtr/traceroute 验证「9929 / CN2 GIA」是不是真的
+
+低价 VPS 常见套路：标称「9929 精品 / CN2 GIA」，实际给普通 NTT/163 中转。用路由跟踪对照 AS 号即可识破。
+
+```bash
+mtr -n -c 10 -r <vps-ip>          # 或 traceroute -n <vps-ip>
+```
+
+看去程/回程经过的骨干网 IP 段，对照下表：
+
+| 宣传 | 应出现的节点特征 | 冒充它的常见「李鬼」 |
+|---|---|---|
+| **联通 AS9929**（精品） | `218.105.x` / `219.158.x`（联通骨干） | NTT `129.250.x`、移动 `223.120.x` |
+| **电信 CN2 GIA**（顶级） | `59.43.x.x`（CN2 专属段） | 普通 163 `202.97.x` |
+| **CN2 GT**（次级） | `59.43.x.x` 但绕路多 | — |
+| 普通 NTT | `129.250.x.x`（AS2914） | — |
+| 普通移动 CMI | `223.120.x` / `221.183.x`（AS58807/9808） | — |
+
+**判定规则**：宣传的段一个都没出现，全程是「李鬼」段 → **虚假宣传**，可据此维权。
+
+> 真实案例：标称「美国9929精品」，mtr 全程 `129.250.x.x`（NTT AS2914）+ 前段移动 `223.120.x`，**无任何 `218.105/219.158` 联通节点** → 实为「移动→NTT」普通中转，非 9929。
+
+## 5.3 延迟与丢包基线（判断线路稳不稳）
+
+```bash
+ping -c 15 -i 0.3 <vps-ip>        # 看 avg 和 mdev(抖动)、丢包率
+```
+
+- **深圳→美西**物理极限 ~150–180ms，改任何配置都压不下去（光速限制）；卡视频是**吞吐**问题不是延迟问题。
+- `mdev`（抖动）大、丢包高 → 线路劣质或晚高峰拥塞。稳定低抖动+0丢包但慢 → 是带宽被限，不是线路烂。
+- 想看视频流畅：选**物理近**的节点——香港/日本/新加坡 ~30–80ms，跨境带宽足，1080p 秒开。美西留作「判美落地」（ChatGPT/Netflix 美区）。
+
+## 5.4 排查「节点是否被蹭」（多设备/UUID 泄露后）
+
+```bash
+# 在 VPS 上看 443 端口所有活动连接的来源 IP
+ssh -p <port> root@<vps-ip> \
+  'ss -tn state established "( sport = :443 )" | grep ":443" | awk "{print \$4}" \
+   | sed "s/.*ffff://; s/:.*//" | sort | uniq -c | sort -rn'
+```
+
+- 全是自己的家宽/移动 IP（多条属正常，浏览器多路复用 + 残留连接）→ **没被蹭**。
+- 出现大量陌生 IP → UUID 可能泄露，按 5.5 换 UUID。
+
+## 5.5 换 UUID（链接泄露 / 疑似被蹭时）
+
+```bash
+# VPS 上：生成新 UUID → 替换 config → 重启
+NEW=$(xray uuid)
+cp /usr/local/etc/xray/config.json /root/config.json.bak
+OLD=$(grep -oP '"id"\s*:\s*"\K[^"]+' /usr/local/etc/xray/config.json | head -1)
+sed -i "s/$OLD/$NEW/g" /usr/local/etc/xray/config.json
+/usr/local/bin/xray run -test -config /usr/local/etc/xray/config.json   # 应 Configuration OK
+systemctl restart xray && systemctl is-active xray
+echo "新 UUID: $NEW"   # 各客户端用它重新导入链接
+```
+
+⚠️ **坑**：若你正**经这台 VPS 的代理**去 SSH 它，`restart xray` 会瞬间掐断自己的 SSH 隧道（出口就是本机）——断开是正常的，直连重连即可，VPS 侧改动已生效。稳妥做法：SSH 走**直连**（不经代理）再执行。VPS 若无 `jq`，用上面的 `sed` 方案即可。
+
+## 5.6 排错速查补充
+
+| 症状 | 原因 | 解法 |
+|---|---|---|
+| 能连但下载/视频龟速，改配置无效 | 跨境线路超售/虚假宣传 | 按 5.1 三段测速定位；5.2 验线路真假；据此维权或换近距离节点 |
+| 标称 9929/CN2 但慢 | 李鬼线路 | 5.2 对照 AS 段；无宣传段=虚假宣传 |
+| `restart xray` 后 SSH 卡死/断开 | SSH 走了经该 VPS 的代理，重启掐断隧道 | SSH 改直连；断了重连，改动已生效 |
