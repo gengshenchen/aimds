@@ -395,3 +395,112 @@ echo "新 UUID: $NEW"   # 各客户端用它重新导入链接
 - 全绿 → 登 ChatGPT / 看 Netflix 美区 / 各种判区服务**好用**，即使不是真住宅 IP。
 - 有红 → 大概率被流媒体/Google 拦，判区场景别指望。
 - **线路快慢（5.1）与 IP 干净（本节）是两回事**：一台可以「IP 很干净但跨境龟速」——判美好用、看视频不行，各取所需。
+
+---
+
+# 第六部分：★ 服务端 BBR + TCP 调优（新 VPS 必做，优先级高于一切排错）
+
+> **这是「代理慢」最常见、最容易被忽略的根因。** 排查顺序应该是：**先查这里 → 再怀疑线路/运营商 → 最后才怀疑被蹭/造假**。
+> 真实案例：一台 50M 的美西 VPS，调优前移动出口 **0.12 Mbps**、联通出口 6.7 Mbps；开 BBR + 调缓冲后 → 移动 **7.6 Mbps（63倍）**、联通 **32 Mbps（4.8倍）**。**线路一个字没改。**
+
+## 6.1 为什么必须做（两个硬伤）
+
+**① 默认缓冲区把高延迟链路锁死在 ~9 Mbps**
+
+TCP 单连接吞吐上限 = `缓冲区 ÷ RTT`。Ubuntu 默认 `rmem_max/wmem_max` 只有 **208KB**：
+
+```
+中美链路 RTT 180ms，带宽 50Mbps
+需要的 BDP = 50e6 × 0.18 ÷ 8 ≈ 1.125 MB
+实际上限   = 208KB
+单连接天花板 = 208KB ÷ 0.18s ≈ 9.2 Mbps   ← 线路再好也吃不满
+```
+
+**② `cubic` 在丢包链路上直接崩**
+
+默认拥塞控制 `cubic` **把丢包当拥塞信号**，一丢包就大幅降速。跨境线路（尤其中国移动 CMI）丢包常见 → 速度崩到 0.1 Mbps 级。
+**BBR 以实测带宽和 RTT 建模、不看丢包**，同一条烂线能拉回几十倍。**「这条线没救」往往只是拥塞算法没选对。**
+
+## 6.2 体检（先看你的机器中没中招）
+
+```bash
+sysctl net.ipv4.tcp_congestion_control    # 是 cubic/reno = 没开 BBR
+sysctl net.core.default_qdisc             # 该是 fq
+sysctl net.core.rmem_max net.core.wmem_max # 208992 = 裸默认，必须调
+sysctl net.ipv4.tcp_slow_start_after_idle # 该是 0
+uname -r                                  # >= 4.9 才支持 BBR
+```
+
+## 6.3 一键调优（幂等，可回滚）
+
+```bash
+# BBR 模块 + 开机自载
+modprobe tcp_bbr
+echo "tcp_bbr" > /etc/modules-load.d/bbr.conf
+
+cat > /etc/sysctl.d/99-network-tuning.conf <<'EOF'
+# ---- BBR + fq ----
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+
+# ---- 缓冲区: 匹配高延迟跨境链路 BDP ----
+net.core.rmem_max = 33554432
+net.core.wmem_max = 33554432
+net.core.rmem_default = 1048576
+net.core.wmem_default = 1048576
+net.ipv4.tcp_rmem = 4096 1048576 33554432
+net.ipv4.tcp_wmem = 4096 1048576 33554432
+net.ipv4.tcp_mem = 786432 1048576 26777216
+net.ipv4.udp_rmem_min = 16384
+net.ipv4.udp_wmem_min = 16384
+
+# ---- 高延迟链路优化 ----
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_window_scaling = 1
+net.ipv4.tcp_sack = 1
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_notsent_lowat = 16384
+
+# ---- 代理场景多并发 ----
+net.core.somaxconn = 32768
+net.core.netdev_max_backlog = 32768
+net.ipv4.tcp_max_syn_backlog = 8192
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_keepalive_time = 600
+net.ipv4.ip_local_port_range = 10000 65000
+fs.file-max = 1048576
+EOF
+
+sysctl -p /etc/sysctl.d/99-network-tuning.conf
+
+# 验证
+sysctl -n net.ipv4.tcp_congestion_control   # 应输出 bbr
+sysctl -n net.core.default_qdisc            # 应输出 fq
+lsmod | grep bbr
+```
+
+**回滚**：`rm /etc/sysctl.d/99-network-tuning.conf && sysctl --system`
+
+> 调优只改内核参数，**不影响 SSH、不用重启、xray 不用动**。改完**立即在客户端实测**（服务端本地测速看不出效果，因为本地出海本来就没瓶颈——**必须从中国这端测**）。
+
+## 6.4 缓冲区数值怎么定
+
+`rmem_max ≥ 带宽(bps) × RTT(s) ÷ 8`，再乘 2-4 倍余量给多连接：
+
+| 链路 | RTT | 带宽 | BDP | 建议 rmem_max |
+|---|---|---|---|---|
+| 中美（美西） | ~180ms | 50M | 1.1MB | 16–32MB |
+| 中港/中日 | ~40ms | 100M | 0.5MB | 8–16MB |
+| 中美（高带宽） | ~180ms | 500M | 11MB | 64MB+ |
+
+上面模板给的 32MB 覆盖绝大多数场景，内存 1G 的小鸡也扛得住（这是上限不是预分配）。
+
+## 6.5 排错速查补充
+
+| 症状 | 原因 | 解法 |
+|---|---|---|
+| 代理速度只有零点几 Mbps，线路却正常 | `cubic` 遇丢包崩溃 | 开 **BBR**（6.3），丢包链路可提升数十倍 |
+| 速度稳定卡在 ~9 Mbps 上不去 | `rmem_max` 208KB 默认值 × 180ms RTT 的天花板 | 调大缓冲区（6.3/6.4） |
+| VPS 本地测速正常、客户端很慢 | 别急着怪线路 | **先做 6.2 体检**，多数是没调优；再按 5.2.1 分运营商测回程 |
+| 调优后服务端本地测速没变化 | 正常 | 服务端出海本无瓶颈，**效果只在中国这端体现** |
