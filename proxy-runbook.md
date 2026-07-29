@@ -353,6 +353,51 @@ echo "新 UUID: $NEW"   # 各客户端用它重新导入链接
 
 ⚠️ **坑**：若你正**经这台 VPS 的代理**去 SSH 它，`restart xray` 会瞬间掐断自己的 SSH 隧道（出口就是本机）——断开是正常的，直连重连即可，VPS 侧改动已生效。稳妥做法：SSH 走**直连**（不经代理）再执行。VPS 若无 `jq`，用上面的 `sed` 方案即可。
 
+## 5.5.1 ★ 全套凭据轮换（私钥泄露时必做，换 UUID 不够）
+
+**什么时候要走这节而不是 5.5**：只要 **REALITY `privateKey`** 有可能外泄（贴进聊天/AI对话/工单/截图/日志，或 `cat` 过凭据文件），**换 UUID 是不够的**——拿到私钥的人可以冒充你的服务端做中间人、也能解密握手。必须把 `privateKey` / `UUID` / `shortId` **三样全部重生成**。
+
+```bash
+set -e
+cd /usr/local/etc/xray
+cp config.json /root/config.json.bak.$(date +%s)
+
+# 1) 生成全新三件套
+KEYS=$(/usr/local/bin/xray x25519)
+PRIV=$(echo "$KEYS" | grep -iE "^private|^PrivateKey" | awk '{print $NF}')
+PUB=$(echo "$KEYS"  | grep -iE "^password|^public"    | awk '{print $NF}')
+NEWUUID=$(/usr/local/bin/xray uuid)
+NEWSID=$(openssl rand -hex 8)
+
+# 2) 取出旧值（VPS 常无 jq，用 grep -oP）
+OLDPRIV=$(grep -oP '"privateKey":\s*"\K[^"]+' config.json)
+OLDUUID=$(grep -oP '"id":\s*"\K[^"]+' config.json)
+OLDSID=$(grep -oP '"shortIds":\s*\["\K[^"]+' config.json)
+
+# 3) 整文件替换
+sed -i "s|${OLDPRIV}|${PRIV}|g; s|${OLDUUID}|${NEWUUID}|g; s|${OLDSID}|${NEWSID}|g" config.json
+
+# 4) 校验后重启
+/usr/local/bin/xray run -test -config config.json     # 必须 Configuration OK
+systemctl restart xray && systemctl is-active xray
+
+# 5) 只打印客户端需要的【公开】参数，私钥留在服务器
+printf 'UUID=%s\nPUBLIC_KEY=%s\nSHORT_ID=%s\n' "$NEWUUID" "$PUB" "$NEWSID"
+# 私钥另存本地只读文件，不要回显
+printf 'PRIVATE_KEY=%s\n' "$PRIV" > /root/reality-creds.txt && chmod 600 /root/reality-creds.txt
+```
+
+拿 5 步输出的三个公开值按 **1.5** 重新拼 `vless://` 链接，**所有客户端（桌面/手机/Mac）都要重新导入**，旧链接立即失效。
+
+### 轮换后的两个必踩坑
+
+| 现象 | 原因 | 解法 |
+|---|---|---|
+| 换完 SSH 连不上，`:22/:443` 全是 **Connection refused**（不是 timeout） | 客户端 TProxy 把去 VPS 的包也拉进了**凭据已失效的隧道**，本地 xray 直接 RST。**服务器其实好着** | 先在客户端导入新链接；或 `sudo systemctl stop v2raya`（`sudo nft delete table inet v2raya`）后直连 SSH |
+| 不确定新凭据对不对，又没法从国内验 | — | 在**服务端本机**按 **1.6** 用新参数自测，`google:200/302` 即凭据正确；顺手 `curl` 一下 speed.cloudflare 看隧道内吞吐 |
+
+> 🔒 **铁律：绝不 `cat` 含私钥的文件**（`/root/reality-creds.txt`、`config.json`）。要看就 `grep` 具体的公开字段，或只 `echo` PublicKey/UUID。凭据一旦进过任何对话、日志、工单、截图，就当它**已经泄露**，立刻按本节轮换——重生成的成本是 1 分钟，泄露的代价是整条链路可被 MITM。
+
 ## 5.6 排错速查补充
 
 | 症状 | 原因 | 解法 |
