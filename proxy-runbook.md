@@ -222,7 +222,7 @@ sudo systemctl start v2raya
 |---|---|---|
 | Gemini 字体/按键加载失败、gstatic 打不开 | gstatic 被 geosite:cn 判成直连，直连 Google 被墙 | RoutingA 加 `domain(geosite:google)->proxy` 且放在 cn 直连**之前** |
 | Chrome 访问 Google 一直转圈 | QUIC(UDP443) 未被正确代理 | RoutingA 加 `network(udp)&&port(443)->block`（或 chrome://flags 关 QUIC） |
-| Gemini「not supported in your country」 | **机房 IP 被封** 或 **Google 账号地区=中国** | 用住宅/家宽 IP 落地；或用只在美国 IP 下使用的干净账号。换 IP 若无效则是账号锁 |
+| Gemini「not supported in your country」 | **这个出口 IP 被 Google 判区拒绝**（与机房/住宅无关，看 IP 历史声誉）；少数情况是账号地区锁 | 按 **5.10** 判定：同账号同设备**换节点 A/B** 打开 `gemini.google.com`。换节点就好=IP 问题，换了还报=账号锁。**别去改支付资料国家** |
 | 导入某节点后 v2rayA 崩、节点全没了 | 该节点协议/参数 Xray 解析不了，拖垮整体配置 | 可疑节点单独建订阅；解析失败就是协议不支持 |
 | nslookup 全是 198.18.x / fc00:: | FakeIP 模式，**正常不是污染** | 无需处理；想看真实 IP 就切回 DoH 显式分流 |
 | nslookup 出现 185.45 / 2001::1 等 | 真·DNS 污染 | 检查「国外域名查询服务器」是否填了 DoH+proxy |
@@ -434,13 +434,15 @@ printf 'PRIVATE_KEY=%s\n' "$PRIV" > /root/reality-creds.txt && chmod 600 /root/r
 
 | 字段 | 好（判区干净） | 差（易被墙/判为代理） |
 |---|---|---|
-| `is_hosting` | `false` | `true`（标准机房，Netflix/Google 常拦） |
+| `is_hosting` | `false` | `true`（标准机房，Netflix 常拦） |
 | `is_vpn`/`is_proxy`/`is_tor` | 全 `false` | 任一 `true` |
 | `as.type` | `isp` | `hosting` |
 
 - 全绿 → 登 ChatGPT / 看 Netflix 美区 / 各种判区服务**好用**，即使不是真住宅 IP。
 - 有红 → 大概率被流媒体/Google 拦，判区场景别指望。
 - **线路快慢（5.1）与 IP 干净（本节）是两回事**：一台可以「IP 很干净但跨境龟速」——判美好用、看视频不行，各取所需。
+
+> ⚠️ **本表只是先验概率，不是判决书——尤其对 Gemini 完全不适用**。实测反例：一台 `AS36352 HostPapa` / `as.type: hosting` / **`is_hosting: true`** 的标准机房 IP，Gemini 开得好好的；另一台同为机房 IP 的却报「not supported in your country」。**决定 Google 判区结论的是「这个 IP 的历史行为」（有没有跑过挖矿/扫描/滥用、有没有被大量薅羊毛），而 `is_hosting` 只说明它在机房**。想知道某站点到底能不能用，只能**实测那个站点**，见 5.10。
 
 ## 5.9 ★ 判定「某站点走代理还是直连」，并给指定域名开直连
 
@@ -515,6 +517,72 @@ domain(domain:example.com)->direct
 
 ⚠️ **DNS 分流和流量分流是两套配置**：加了直连规则后，该域名的**解析**仍按「国外域名」走加密 DoH 经隧道查询（首次可能仍要几秒）。有 DNS 缓存所以只卡首访；真要治只能在 `/etc/hosts` 钉死 IP，代价是 anycast 地址变更后要手动更新（表现为突然连不上）。
 
+## 5.10 ★ Gemini/判区类服务打不开：怎么定位是 IP、账号还是配置
+
+> 场景：Gemini 报 `Gemini isn't currently supported in your country. Stay tuned!`，但同一节点下 Gmail、搜索、YouTube 全正常。
+
+### 唯一可靠的判定法
+
+**同一台设备、同一个 Google 账号、保持登录状态，只换节点，打开 `gemini.google.com`。**
+
+| 换到另一个节点后 | 结论 |
+|---|---|
+| 能正常打开 | **就是原节点的出口 IP 问题**。换节点或换机器，配置别动 |
+| 还是同样报错 | 才轮到怀疑**账号地区锁**（该账号长期在被判为受限地区的 IP 下使用） |
+
+一次 A/B 就能定性，比下面任何侧面信号都强。
+
+### 六个「看着能判、其实全判不出来」的信号（都实测踩过）
+
+| 信号 | 为什么没用 |
+|---|---|
+| IP 地理位置（`gl=US`、`cdn-cgi/trace` 的 `loc=US`） | 能开的和不能开的**两台都是 US**。判区结论不等于地理位置 |
+| ip-api 的 `proxy=false` / `hosting=false` | 两台都显示"干净"，区分不了 |
+| ipinfo 的 `privacy` 全 false、`is_anonymous:false` | 同上。**`is_hosting:true` 也照样能开 Gemini**（见 5.8 的警告） |
+| **直接打开 `https://www.google.com/sorry/index`** | ❌ **最坑的一个**。这个 URL 本来就是渲染验证码页的，**任何节点访问它都出「unusual traffic」页**——能开 Gemini 的节点也出。拿它判黑名单会得到 100% 假阳性 |
+| 无痕模式 / 未登录访问 | 落地页**不套用登录后的区域门禁**，无痕下能打开不代表登录后能用 |
+| 支付资料国家（Payments profile Country/Region 显示 HK） | 红鲱鱼。官方支持列表里有香港，**且千万别点「Create new profile」**——那是不可逆的账户变更，跟 Gemini 判区无关 |
+
+### 唯一能用的侧面信号（比 A/B 弱，但一条命令就能跑）
+
+不是"访问 `/sorry`"，而是**看 `gemini.google.com` 会不会被弹到 `/sorry`**：
+
+```bash
+for u in https://www.google.com/ https://gemini.google.com/; do
+  printf '%-32s ' "$u"
+  curl -4 -s -o /dev/null -w 'code=%{http_code} -> %{redirect_url}\n' --max-time 15 \
+    -A 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36' "$u"
+done
+```
+
+判读（关键是**两行对比**，不是看单行）：
+
+- `www.google.com` 正常（200，或 302 到 `.com.hk`——这是无 cookie 时的 ccTLD 跳转，**不是被封**），而 `gemini.google.com` **302 到 `/sorry/index`** → 这个出口被 Gemini 单独拒绝了 ✅ 与实际报错吻合。
+- 两行都正常 → 该 IP 对 Gemini 没有拦截。
+- 两行都被弹 `/sorry` → 整个 IP 被 Google 限流，不只是 Gemini。
+
+### 顺带排除「是不是套了 WARP / 到底走没走代理」
+
+```bash
+curl -4 -s --max-time 12 https://www.cloudflare.com/cdn-cgi/trace | grep -E '^(ip|loc|warp|colo)='
+```
+
+`warp=` 是 **Cloudflare 自己**报告这个请求有没有从它的 WARP 隧道进来，比任何第三方 IP 库都权威；`ip=` 同时给出真实出口（可核对是不是你选的节点，顺便验证代理确实生效）。
+
+> **别指望 WARP 解锁 Gemini**：WARP 出口是 AS13335 的巨型共享池，Google 当匿名器处理，`/sorry` 验证码和判区拦截反而**更多**。WARP 的口碑在 ChatGPT 和 IPv6，不在 Google 判区。
+
+### 结论与对策
+
+- **同为机房 IP，能不能开 Gemini 的差别在「这个 IP 的历史行为」**——被入侵过、跑过矿马/扫描的 IP，**重装系统洗不掉 Google 那边的账**（IP 没变）。这也是 1.7 加固值得做的另一个理由：一次沦陷可能永久损伤这个 IP 的判区能力。
+- **换更贵的「精品线路」（CN2 GIA / 9929 / CMIN2）不解决判区问题**：那是**线路质量**（5.1/5.2），判区看的是**IP 声誉**（5.8/5.10），**两个正交的轴**。花钱买 CMIN2 是为了看视频不卡，不是为了开 Gemini。
+- **⚠️ v2rayA 做不到「按域名分发到不同节点」**：它的 outbound 只有 `proxy`（=唯一选中的那个节点）/`direct`/`block`/`dns-out`，RoutingA 里写什么规则都只能在这几个里选。**想同时要「快节点」和「能开 Gemini 的节点」，得把客户端内核换成 mihomo(Clash.Meta) 或 sing-box**，用 proxy-group：
+
+  ```
+  gemini.google.com, generativelanguage.googleapis.com  →  解锁节点
+  其余国外                                              →  快节点
+  geosite:cn                                            →  direct
+  ```
+  Gemini 是纯文本交互，分给慢节点也无所谓。
 
 ---
 
