@@ -229,6 +229,7 @@ sudo systemctl start v2raya
 | curl gstatic 返回 404 | 请求根路径无内容，**连接是成功的** | 正常，用 `/generate_204` 测会返回 204 |
 | 代理挂了整机断网（含国内） | TProxy 规则残留、进程没了 | 第 2.6 兜底；急救 `sudo systemctl restart/stop v2raya` |
 | 客户端连不上但服务端自测(1.6)通过 | 客户端内核太旧 | 升级客户端；或服务端 Xray 降到同代稳定版 |
+| 想让某个站点直连，但不确定它有没有被拉进隧道 | 解析到境外 IP 的域名不匹配 `geosite:cn`/`geoip:cn`，被 `default->proxy` 兜走 | 按 **5.9** 用受控实验判定（**别用 `ping`/`time_connect`/短 `curl` 探针，全是假信号**），再加 `domain(domain:xxx)->direct` |
 | VPS CPU 99%、进程名像 `kswapd0` 但 **RES≠0** 或 `/proc/<pid>/exe` 指向 `/etc`、`/tmp`、`/dev/shm` | **挖矿木马冒充内核线程**，多因暴露的 3x-ui 面板被入侵 | 真内核线程 RES=0、exe 指不到文件、PPID=2；反之即木马。备份参数→重装系统→按 1.7 加固，别装公网面板 |
 
 ---
@@ -440,6 +441,80 @@ printf 'PRIVATE_KEY=%s\n' "$PRIV" > /root/reality-creds.txt && chmod 600 /root/r
 - 全绿 → 登 ChatGPT / 看 Netflix 美区 / 各种判区服务**好用**，即使不是真住宅 IP。
 - 有红 → 大概率被流媒体/Google 拦，判区场景别指望。
 - **线路快慢（5.1）与 IP 干净（本节）是两回事**：一台可以「IP 很干净但跨境龟速」——判美好用、看视频不行，各取所需。
+
+## 5.9 ★ 判定「某站点走代理还是直连」，并给指定域名开直连
+
+> 场景：某个站点（内网 API、国内加速的服务、公司系统）你**希望它直连**，但不确定 TProxy 有没有把它拉进隧道。下面先给**可靠的判定法**，再给改法。
+
+### 先记住三个「看起来能判、实际不能判」的坑
+
+| 方法 | 为什么不能用 |
+|---|---|
+| 看 `curl` 的 `time_connect` | TProxy 下 TCP 握手由**本地 xray 直接应答**，`connect` 恒为 ~0.0001s。直连站和代理站**完全一样**，区分不了 |
+| `ping` 目标 IP 的 RTT | **ICMP 不被 TProxy 拦**，永远走直连路径。遇上 anycast 更会落到就近 PoP，给出与 TCP 毫不相干的 RTT（实测同一站：ICMP 86ms / 走代理 TLS 655ms / 直连 TLS 143ms） |
+| `curl --max-time 5` 打一发，去出口侧看有没有连接 | **最阴的假阴性**：若该域名 DNS 慢（本例 4–6 秒），请求在进入 TCP 阶段前就超时了，压根没连上 → 出口侧当然是 0 条 → 被读成「直连」。**探针自己失败，长得和直连一模一样** |
+
+勉强能用的弱信号是 `time_appconnect - time_connect`（TLS 握手净耗时）：一个往返量级≈直连，明显翻倍=绕了出口。但要定性还得看下面。
+
+### 受控实验法（唯一可靠）
+
+思路：**在本机挂住 N 条长连接，同时到出口 VPS 上数目的 IP 的 ESTABLISHED**——计数精确 `+N` 才是走代理，恒为 0 才是直连。
+
+```bash
+DOMAIN=<要测的域名>; PREFIX=<该域名解析出的 IP 前缀，如 203\.0\.113\.>
+q(){ ssh -p <port> root@<vps-ip> "ss -tn state established | grep -cE '$PREFIX'"; }
+
+echo "基线:  $(q)"                    # 记下基线，不能只看绝对值
+for i in 1 2 3; do                    # 挂 3 条真实 TLS 长连接(sleep 喂 stdin 保持不关)
+  sleep 40 | openssl s_client -connect $DOMAIN:443 -servername $DOMAIN -quiet >/dev/null 2>&1 &
+done
+sleep 9
+echo "本机侧: $(ss -tn state established | grep -cE "$PREFIX")"   # ★必须非 0
+echo "出口侧: $(q)"
+kill $(jobs -p) 2>/dev/null
+```
+
+判读：
+
+| 本机侧 | 出口侧 | 结论 |
+|---|---|---|
+| 非 0 | 基线 **+N** | **走代理** |
+| 非 0 | 仍是**基线** | **直连** |
+| **0** | 任意 | ❌ **实验无效**——连接压根没建立，出口侧的 0 是假阴性。查 DNS 是否超时、域名端口是否对 |
+
+两条铁律：
+1. **必须确认本机侧真的建立了连接**（`ss` 计数非 0），这是防假阴性的唯一防线。
+2. **必须取基线看增量**。出口 VPS 常被多端共用（桌面/手机/Mac），别人的流量会污染绝对值。拿一个**已知国内站**（如 `www.baidu.com`）同时做对照组最稳：它在出口侧应恒为 0。
+
+### 改法：给指定域名开直连
+
+先确认分流规则**实际生效的样子**。注意 `/etc/v2raya/config.json` **不是 v2rayA 的设置文件，而是它生成给 xray 的运行时配置**（`xray run --config=` 指向它）；v2rayA 自己的设置在同目录 boltdb 里，grep `"mode"` 之类什么都匹配不到。
+
+```bash
+# 只打印路由规则(不含 UUID,可安全外发)。★ 别在对象里用 // empty,见下面的坑
+sudo jq -r '.routing.rules | to_entries[] | "\(.key) out=\(.value.outboundTag // "-") \
+ net=\(.value.network // "-") port=\(.value.port // "-") \
+ domain=\(((.value.domain // []) | join(","))[0:100]) ip=\(((.value.ip // []) | join(","))[0:100])"' \
+ /etc/v2raya/config.json
+```
+
+> 💥 **jq 的坑（曾据此得出完全错误的结论）**：jq 对象构造是**生成器的笛卡尔积**，`{out: .outboundTag, domain: (.domain // empty)}` 在 `.domain` 缺失时会让**整个对象消失**，不是只少一个字段。每条路由规则天然只带 domain/ip/port 之中的一个 → 19 条规则被全部抹掉、输出 `[]`，很容易误判成「路由规则是空的 / xray 跑的是陈旧配置」。**要省略字段就直接写 `.domain`（缺失时为 null）**，并用 `(.routing.rules|length)` 单独核对条数。
+
+看清结构后就能定位原因。典型分工是：**nft 表 `inet v2raya` 的 `whitelist` 只含私有网段**（没有国内 IP 集合），它只负责把所有公网流量打标送进 xray；**国内外分流全在 xray 的 `routing.rules` 里**。于是一个**解析到境外 IP** 的域名（例如落在 AWS/Cloudflare anycast 上），既不匹配 `geosite:cn` 也不匹配 `geoip:cn`，就会被最后的 `default->proxy` 兜进隧道。
+
+改法：面板 → 设置 → **自定义路由(RoutingA)**，在规则**最前面**加一行：
+
+```
+domain(domain:example.com)->direct
+```
+
+- `domain:` 前缀是**子域匹配**，`api.example.com`/`code.example.com` 一并覆盖。
+- 放最前面，确保排在所有 `block`/`proxy` 规则之前。
+- 透明代理下能按域名匹配靠 **sniffing**；若原有 `geosite:google`/`geosite:cn` 规则一直正常，说明 sniffing 是开着的，这行就会生效。想再兜一层可加 `ip(<IP>/32)->direct`，但 anycast 地址常与别的服务共用，会顺带放行它们，一般不必。
+- 保存会**重启 xray、连接闪断**。改完用上面的受控实验复验：出口侧应变成恒为 0。
+
+⚠️ **DNS 分流和流量分流是两套配置**：加了直连规则后，该域名的**解析**仍按「国外域名」走加密 DoH 经隧道查询（首次可能仍要几秒）。有 DNS 缓存所以只卡首访；真要治只能在 `/etc/hosts` 钉死 IP，代价是 anycast 地址变更后要手动更新（表现为突然连不上）。
+
 
 ---
 
