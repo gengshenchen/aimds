@@ -17,6 +17,9 @@
 
 适用：一台干净的 Ubuntu VPS（root）。若上面有旧的 3x-ui/xray，先卸载（见 1.0）。
 
+> 🐧 **用 AlmaLinux / Rocky / RHEL 9？** 本部分命令有一半会报错（`apt-get`/`ufw`/`restart ssh`）。见 **[proxy-runbook-almalinux9.md](proxy-runbook-almalinux9.md)**，内含一键脚本与 EL9 专属排错表。
+> ⚠️ 其中**第 1 节的权限坑不分发行版**——凡是用官方 systemd 单元（`User=nobody`）的机器都会中：给 `config.json` 上 `chmod 600` 后，`xray run -test` 因为是 root 执行**照样报 Configuration OK**，服务却起不来。**「校验通过但服务挂」先查权限**，别去改 JSON。
+
 > 💥 **被入侵后重建**（如发现 `kswapd0` 等矿马、CPU 99%、SSH 都握不上手）：别手动清木马（后门难清干净），**直接在服务商后台重装系统**成干净镜像，再照本手册走一遍，最后**务必做 1.7 加固**。本手册用纯 Xray、**不装公网面板**，从根上去掉被打的入口。
 
 ### 1.0（可选）清理旧代理
