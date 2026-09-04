@@ -55,11 +55,15 @@ sudo nft list set inet v2raya whitelist | grep -q '100.64.0.0/10' && echo "OK: 1
 ### 2.2 关键：让本机 v2rayA 不代理 Tailscale
 按严重性从高到低任选：
 
-- **最省事**：远程桌面期间，**把本机 v2rayA 断开/退出**（或关掉 Tun/全局模式）。Tailscale 立刻走直连。
+- **v2rayA WEB 控制台分流（推荐）**：
+  在 v2rayA 控制台（`http://127.0.0.1:2017`）-> **设置 (Settings)**：
+  1. 将 **透明代理模式 (Transparent Proxy)** 设为 **“绕过大陆及局域网” (Bypass mainland China and LAN)**。
+  2. 在自定义规则配置中显式添加 Tailscale 专属 CGNAT 网段直连：
+     ```text
+     ip(100.64.0.0/10) -> direct
+     ```
 - **系统代理模式**：把 v2rayA 切成 **“系统代理(System Proxy)”而非 Tun/透明代理**——系统代理只影响认它的 App，而 Tailscale 用裸 UDP，不吃系统 HTTP/SOCKS 代理，天然绕开。
-- **Tun/全局模式下必须加分流白名单**（RoutingA 或对应设置），让下列走 **direct**：
-  - `100.64.0.0/10`（Tailscale 叠加网段）
-  - Tailscale 的 tun 网卡 / DERP 探测流量
+- **最省事**：远程桌面期间，**把本机 v2rayA 断开/退出**（或关掉 Tun/全局模式）。Tailscale 立刻走直连。
 
 ### 2.3 NoMachine 连接
 新建连接，主机填**被连方的 `100.x`**（例 `100.116.230.54`），端口 `4000`。**不要**填对方的 `192.168/172.16` 内网 IP。
@@ -82,21 +86,37 @@ sudo nft list set inet v2raya whitelist | grep -q '100.64.0.0/10' && echo "OK: 1
 
 ---
 
-## 4. 验证：直连还是中继？（在被连方跑）
+## 4. 验证：直连（P2P）还是中继（DERP）？（在被连方或客户端跑）
+
+要判断 NoMachine 当前是否在走 **P2P 点对点直连**，运行以下命令：
+
 ```bash
-tailscale status | grep -i <客户端名>
-tailscale ping <客户端名>
+tailscale status
+tailscale ping <对端Tailscale-IP或设备名>
 ```
-判读那一行结尾 / ping 的 `via`：
 
-| 看到 | 含义 | 好坏 |
-|---|---|---|
-| `direct 1.2.3.4:41641` | 点对点直连 | ✅ 最好 |
-| `relay "sin"` / `relay "hkg"` | 经新加坡/香港中继 | 🟡 没打通洞，但没绕远，~50-140ms 可用 |
-| `relay "sfo"`（你在国内却中继美国） | **某端把 Tailscale 走了代理** | ❌ 400ms+ 巨卡，回第 2.2 节修 |
-| `direct connection not established` | NAT 太硬（多为手机热点） | 🟡 换网络或接受中继 |
+### 判读命令输出：
 
-`tailscale netcheck` 若显示 `Nearest DERP` 是国内附近（sin/hkg/tok）且公网 IP 是国内 IP，说明本机 Tailscale 没被代理。
+1. **P2P 点对点直连 (Direct / 最优 ✅)**：
+   - `tailscale ping` 返回类似：`pong from macbook (100.120.116.81) via 192.168.1.71:41641 in 5ms`
+   - 只要包含 `via <IP>:<端口>` 或 `direct <IP>:<端口>` 且延迟在几毫秒到几十毫秒，说明已建立 **P2P 直连**，NoMachine 画音数据在两台设备间点对点传输，不经过中继服务器。
+
+2. **DERP 服务器中继 (Relay / 次优 🟡)**：
+   - `tailscale ping` 返回类似：`pong from macbook (100.120.116.81) via DERP(tok) in 65ms`
+   - 说明 NAT 打洞未成功（多因硬 NAT 或防火墙阻断 UDP 41641），流量由 Tailscale 的 DERP 中继节点转发。
+
+3. **被代理误劫持 (Relay SFO / 最差 ❌)**：
+   - 输出显示 `via DERP(sfo)`（美国节点）且延迟高达 400ms+。
+   - 说明 Tailscale 流量被 v2rayA 代理到了国外，需回到第 2.2 节配置 `100.64.0.0/10 -> direct` 规则。
+
+| 提示输出 | 连接类型 | 性能与延迟 | 优化建议 |
+|---|---|---|---|
+| `via 192.168.x.x:41641` | 局域网 P2P 直连 | ⚡ 极致 (1~5ms) | 体验最佳，无需调整 |
+| `via <公网IP>:41641` | 跨网 P2P 直连 | 🚀 极佳 (10~30ms) | 点对点打通成功 |
+| `via DERP(tok/hkg)` | 附近 DERP 中继 | 🟡 一般 (50~140ms) | 检查路由器 UPnP 或切换连接网络 |
+| `via DERP(sfo)` | 国外 DERP 代理误劫持 | ❌ 极差 (400ms+) | 将 `100.64.0.0/10` 设为 v2rayA 直连 |
+
+`tailscale netcheck` 若显示 `Nearest DERP` 是国内附近（tok/hkg/sin）且公网 IP 是国内 IP，说明本机 Tailscale 传输未被代理误劫持。
 
 ---
 
