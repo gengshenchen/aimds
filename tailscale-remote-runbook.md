@@ -194,6 +194,14 @@ v2raya-watchdog[294649]: proxy path down (last='000'); stopping v2raya to fail o
 
 **根因**：v1 探针 `curl http://www.google.com/generate_204 --max-time 6` 把 DNS 串在关键路径上——`www.google.com` 不属 `geosite:cn`，要先经 `https://1.1.1.1/dns-query` 在**隧道里**做一次 DoH 往返，再在同一个 6 秒预算内跑完 HTTP。DoH 那腿慢过 6s 就吐 `000`，**隧道其实完全健康**。三连败共 26 秒的窗口对凌晨跨太平洋线路（06:31 CST = 美西下午拥塞时段）远不算异常，而停服后按设计不自动重连 → 一次瞬断换来 5 小时失联。
 
+**实证（v2rayA 面板 Logs，2026-09-05 13:13 换 v2 后抓到）**——这不是推断，DNS 的额外开销在日志里看得见：
+```
+13:13:17.061 from 172.16.1.242:44534 accepted tcp:1.1.1.1:443        [transparent_ipv4 -> proxy]   ← v2 探针，直接进隧道
+13:13:18.350 from DNS accepted tcp:119.29.29.29:53                   [dns -> direct]               ← 1.3s 后仍在补做解析
+13:13:19.154 from DNS accepted tcp:208.67.220.220:5353               [dns -> direct]               ← 又 0.8s，串行第二轮
+```
+后两条是 `dns.alidns.com` 的**引导解析**（DoH 的域名自己得先解析），且**回落到 TCP 53**、两轮串行 ≈ 1.9s。v1 的 6s 预算要塞进「引导解析 → DoH 往返 → HTTP」整条链；v2 用纯 IP 目标，`1.1.1.1:443` 一条就进 `proxy`，全程不产生任何 `[dns -> ...]` 依赖。**这就是「探针不能依赖被探测系统的 DNS」的实测依据。**
+
 **排除项**（都查过）：本机无 suspend、无链路 down、`systemd-resolved` 静默；最近 DHCP 续租在 06:20:28 和 06:34:17，**都不在 06:31:12 的杀死窗口内**；节点 443 事后实测可达。
 
 **教训**：
