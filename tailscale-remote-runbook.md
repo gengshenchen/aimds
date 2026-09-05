@@ -126,21 +126,20 @@ tailscale ping <对端Tailscale-IP或设备名>
 
 **兜底 = 健康看门狗**：定时探测代理是否通，连不通就 `stop v2raya` → 触发 failopen 删 nft 表 → 全部直连 → 远程链路恢复。配合 v2rayA 的 failopen drop-in（`ExecStopPost` 删表 + `Restart=on-failure`，见 proxy-runbook.md）。
 
-`/usr/local/bin/v2raya-node-watchdog.sh`：
-```bash
-#!/usr/bin/env bash
-set -u
-systemctl is-active --quiet v2raya || exit 0
-TARGET="http://www.google.com/generate_204"   # 只有走通代理才回 204
-code=""
-for i in 1 2 3; do
-    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 6 "$TARGET" 2>/dev/null)
-    [ "$code" = "204" ] && exit 0
-    sleep 4
-done
-logger -t v2raya-watchdog "proxy path down (last='${code}'); stopping v2raya to fail open"
-systemctl stop v2raya
-```
+`/usr/local/bin/v2raya-node-watchdog.sh` → **[scripts/v2raya-node-watchdog.sh](scripts/v2raya-node-watchdog.sh)**（脚本较长，独立成文件，别再内联抄）。
+
+判据分三层，缺一层就会误杀（血泪见 5.1）：
+
+| 层 | 探测 | 失败含义 | 动作 |
+|---|---|---|---|
+| 1 本地链路 | TCP `223.5.5.5:443`（geoip:cn→直连） | 是本机/ISP 断网，**不是节点的错** | 不停服（停了链路恢复时反而没代理） |
+| 2 隧道 | `curl https://1.1.1.1/cdn-cgi/trace` 回 `ip=` | 非 CN 流量出不去 | 计数 +1 |
+| 3 节点 | TCP `<节点IP>:443`（routing rule 0 判直连） | 节点真死（会黑洞 Tailscale 的那种） | 2 次即 fail-open |
+
+- **探针必须用纯 IP**。`1.1.1.1` 在国内直连被墙、又不属 `geoip:cn`，所以「有响应」= 隧道通，且**全程不碰 DNS**。
+- 节点通而只是隧道抖（证书/UUID/被 QoS），撑满 `KILL_AFTER=4` 次（45s 一轮 ≈ 3 分钟）才停。
+- 失败计数存 `/run/v2raya-watchdog.fails`，**跨 timer 周期累计**，单轮瞬断不再构成死刑。
+
 `/etc/systemd/system/v2raya-watchdog.service`：
 ```ini
 [Unit]
@@ -163,13 +162,46 @@ WantedBy=timers.target
 ```
 启用：
 ```bash
-sudo install -m755 v2raya-node-watchdog.sh /usr/local/bin/
+sudo install -m755 scripts/v2raya-node-watchdog.sh /usr/local/bin/v2raya-node-watchdog.sh
 sudo cp v2raya-watchdog.service v2raya-watchdog.timer /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable --now v2raya-watchdog.timer
-# 手动测：健康时应退出码 0 且 v2raya 仍 active
-sudo /usr/local/bin/v2raya-node-watchdog.sh; echo "退出码=$?"; systemctl is-active v2raya
+```
+**装之前先确认探针在你的链路上成立**（不成立就别装，否则等于装了个定时炸弹）：
+```bash
+curl -s --max-time 8 https://1.1.1.1/cdn-cgi/trace | grep -E '^(ip|loc)='
+# 期望: ip=<你的节点IP>  loc=US   ← 同时验证了出口确实是节点
+```
+再手动跑一轮，健康时应退出码 0、v2raya 仍 active、计数归零：
+```bash
+sudo /usr/local/bin/v2raya-node-watchdog.sh; echo "退出码=$?"
+systemctl is-active v2raya; cat /run/v2raya-watchdog.fails   # 期望 active / 0
+```
+日常观察（v2 只在失败时说话，能看到中间态而非只在死后留一行）：
+```bash
+journalctl -t v2raya-watchdog -f
+# probe failed 2/4 (node <节点IP> dead=0); waiting
 ```
 > 停后**不自动重连**（故意：失败永远倒向“能上网/能远程”）。节点恢复后手动 `sudo systemctl start v2raya`。
+
+### 5.1 复盘：看门狗自己成了故障源（2026-09-05）
+
+**症状**：早 06:31 面板 `http://127.0.0.1:2017` 打不开，且已躺了近 5 小时。节点本身好的（手机能连）。
+
+**日志只有一行**，`000` = 连 HTTP 状态码都没拿到，DNS 失败和连接超时长得一模一样，事后分不出是哪种：
+```
+v2raya-watchdog[294649]: proxy path down (last='000'); stopping v2raya to fail open
+```
+
+**根因**：v1 探针 `curl http://www.google.com/generate_204 --max-time 6` 把 DNS 串在关键路径上——`www.google.com` 不属 `geosite:cn`，要先经 `https://1.1.1.1/dns-query` 在**隧道里**做一次 DoH 往返，再在同一个 6 秒预算内跑完 HTTP。DoH 那腿慢过 6s 就吐 `000`，**隧道其实完全健康**。三连败共 26 秒的窗口对凌晨跨太平洋线路（06:31 CST = 美西下午拥塞时段）远不算异常，而停服后按设计不自动重连 → 一次瞬断换来 5 小时失联。
+
+**排除项**（都查过）：本机无 suspend、无链路 down、`systemd-resolved` 静默；最近 DHCP 续租在 06:20:28 和 06:34:17，**都不在 06:31:12 的杀死窗口内**；节点 443 事后实测可达。
+
+**教训**：
+1. **健康探针不能依赖被探测系统的 DNS**，用纯 IP 目标。
+2. **单轮判决 = 把瞬断当死亡**，计数要跨周期累计（`/run` 存盘）。
+3. **要能区分「我断网」和「节点死」**，否则本地断网时停服会让链路恢复时也没代理。
+4. **`xray` 的 `"error":"none"` 让事故无法回溯**——想留证据就把 loglevel 调回 `warning`。
+5. 探针失败**必须记可诊断的中间态**，只在死后留一行 `000` 等于没记。
 
 ---
 
@@ -180,6 +212,10 @@ sudo /usr/local/bin/v2raya-node-watchdog.sh; echo "退出码=$?"; systemctl is-a
 | Mac 在国内却 `relay "sfo"`、延迟 400ms+ | **Mac 的 v2rayA 全局/Tun 代理把 Tailscale 送去了美国节点** | 断开 Mac 的 v2rayA，或切系统代理模式，或白名单放行 `100.64.0.0/10`（第 2.2 节） |
 | `direct connection not established`，走 relay | NAT 太硬（手机热点 CGNAT）打不了洞 | 客户端换家用宽带；两台连同一 WiFi 直接局域网直连；路由器开 UPnP |
 | 连不上、超时 | 被连方 ufw 挡了 4000 / 填了对方内网 IP | `ufw allow 4000/tcp,udp`；主机地址填对方 `100.x` |
+| 面板 `127.0.0.1:2017` 打不开，服务 inactive | **看门狗误杀**：探针含 DNS 腿，一次瞬断即停服；停后故意不自动重连 | `journalctl -t v2raya-watchdog` 看是否有 `proxy path down`；`systemctl start v2raya`；换 v2 探针（第 5 节 + 5.1） |
+| 看门狗日志只有 `last='000'` | `000` = 没拿到状态码，DNS 失败/超时不可区分 | 改用纯 IP 探针，并记录 `probe failed N/4` 中间态 |
+| `stop v2raya` 时 `nft delete table` 报 `No such file or directory` | 表在 stop 前已不存在（xray 先自己崩了），`ExecStopPost` 的 `-` 前缀已忽略返回值 | **无害**，可忽略 |
+| `nft list table inet v2raya` 报 `Operation not permitted` | 非 root 读不到 netlink，**不代表表不存在** | 加 `sudo`；或用 `curl https://1.1.1.1/cdn-cgi/trace` 看出口 IP 判断 TProxy 是否生效 |
 | 画面糊/慢但不断 | NoMachine 画质设太高 | Display 画质拉到 speed、开硬件编码、降分辨率/色深 |
 | 节点一挂远程就失联 | v2rayA 黑洞了流量 | 装第 5 节看门狗；应急直连 `sudo systemctl stop v2raya`（failopen 删表回直连） |
 | `tailscale ping` 全超时 | 对端离线/休眠 | 确认对端 Tailscale 在线；被连方设为不休眠 |
