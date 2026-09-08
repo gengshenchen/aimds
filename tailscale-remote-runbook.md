@@ -128,15 +128,16 @@ tailscale ping <对端Tailscale-IP或设备名>
 
 `/usr/local/bin/v2raya-node-watchdog.sh` → **[scripts/v2raya-node-watchdog.sh](scripts/v2raya-node-watchdog.sh)**（脚本较长，独立成文件，别再内联抄）。
 
-判据分三层，缺一层就会误杀（血泪见 5.1）：
+判据分四层，缺一层就会误杀或漏杀。**第 2 层是关键**——它修正了 v2 的缺陷：v2 把「隧道探测」（层 3）和「TProxy 劫持」耦合，一旦 TProxy 的 ip rule 被 DHCP 续租 / Tailscale 重排冲掉，探针必然失败，v2 误判隧道故障、fail-open 杀了 v2raya——而杀 v2raya 恰恰无法恢复 TProxy（只有重启 v2raya 才重挂）。v3 新增「TProxy 存活检查」，发现 TProxy 掉了就**重启 v2raya 自愈**，而不是杀服务（详见 5.2）：
 
 | 层 | 探测 | 失败含义 | 动作 |
 |---|---|---|---|
 | 1 本地链路 | TCP `223.5.5.5:443`（geoip:cn→直连） | 是本机/ISP 断网，**不是节点的错** | 不停服（停了链路恢复时反而没代理） |
-| 2 隧道 | `curl https://1.1.1.1/cdn-cgi/trace` 回 `ip=` | 非 CN 流量出不去 | 计数 +1 |
-| 3 节点 | TCP `<节点IP>:443`（routing rule 0 判直连） | 节点真死（会黑洞 Tailscale 的那种） | 2 次即 fail-open |
+| 2 TProxy 存活 | `ip rule` 有 `fwmark 0xc0 lookup 100` 且 `nft inet v2raya` 表在 | TProxy 被 DHCP/Tailscale 重排冲掉（此时探针必假失败） | **重启 v2raya 重建**，不计数、不杀（60s 限速防抖） |
+| 3 隧道 | `curl https://1.1.1.1/cdn-cgi/trace` 回 `ip=`（前提：层 2 已确认 TProxy 在） | 非 CN 流量出不去 | 计数 +1 |
+| 4 节点 | TCP `<节点IP>:443`（routing rule 0 判直连） | 节点真死（会黑洞 Tailscale 的那种） | 2 次即 fail-open |
 
-- **探针必须用纯 IP**。`1.1.1.1` 在国内直连被墙、又不属 `geoip:cn`，所以「有响应」= 隧道通，且**全程不碰 DNS**。
+- **探针必须用纯 IP**。`1.1.1.1` 在国内直连被墙、又不属 `geoip:cn`，所以「有响应」= 隧道通，且**全程不碰 DNS**。但前提是 TProxy 把 `1.1.1.1:443` 劫持进了 proxy——这正是层 2 要守护的：TProxy 不在时，纯 IP 探针会「假失败」，绝不能据此判隧道故障。
 - 节点通而只是隧道抖（证书/UUID/被 QoS），撑满 `KILL_AFTER=4` 次（45s 一轮 ≈ 3 分钟）才停。
 - 失败计数存 `/run/v2raya-watchdog.fails`，**跨 timer 周期累计**，单轮瞬断不再构成死刑。
 
@@ -211,6 +212,25 @@ v2raya-watchdog[294649]: proxy path down (last='000'); stopping v2raya to fail o
 4. **`xray` 的 `"error":"none"` 让事故无法回溯**——想留证据就把 loglevel 调回 `warning`。
 5. 探针失败**必须记可诊断的中间态**，只在死后留一行 `000` 等于没记。
 
+### 5.2 复盘：v2 会因 TProxy 被冲而误杀（2026-09-08）
+
+**症状**：09-07 早 05:32 v2raya 又被看门狗杀了，但节点和本地链路都是好的（手机能连、`223.5.5.5` 通、节点 443 通）。
+
+**根因**：v2 的第二层探针 `curl https://1.1.1.1/cdn-cgi/trace` 想用「1.1.1.1 有响应」证明隧道通，但这话成立有个**隐藏前提**——TProxy 必须把 `1.1.1.1:443` 劫持进 proxy。而 TProxy 靠的是 ip rule（`fwmark 0xc0 lookup 100`）+ nft 表（`inet v2raya`），这两样会**在运行中被 DHCP 续租 / Tailscale 重排路由时从内核里冲掉**（`tailscaled` 日志 `ip rule deleted: ... Table:100 Mark:192`，`ip rule show` 里那条 `fwmark 0xc0 lookup 100` 直接消失）。TProxy 一没，`1.1.1.1` 就改走直连、被墙，探针**必然假失败**。v2 把假失败当隧道故障，累计 4 次后 fail-open 杀了 v2raya——可杀 v2raya 根本不会重挂 TProxy（只有重启 v2raya 才修），等于真故障发生时杀掉了唯一能修复它的东西，还让被墙流量全裸奔。
+
+**实证**（都是直接证据）：
+- `ip rule show` 里 TProxy 那条 `fwmark 0xc0 lookup 100` **消失了**（重启 v2raya 后 5209 行才回来）。
+- `tailscaled` 日志：`monitor: ip rule deleted: ... Table:100 Mark:192`、`RTM_DELROUTE`。
+- DHCP 续租（09-07 05:27:25 `dhcp4 new lease`）先于杀死（05:32:31）约 5 分钟——续租重排路由，正好把 ip rule 冲掉。
+- 重启 v2raya 后 `1.1.1.1` 探针立刻恢复 `ip=<节点IP> loc=US`，证明隧道本身一直健康，只是 TProxy 掉线。
+
+**修复（v3）**：新增「TProxy 存活检查」作为独立一层——每次先看 `ip rule` 有无 `fwmark 0xc0 lookup 100`、`nft inet v2raya` 表在不在；任一缺失就**重启 v2raya 重建 TProxy**（自愈，不累计、不杀），并加 60s 限速防止 DHCP 期间疯狂重启。只有确认 TProxy 存活、隧道仍失败，才走「节点死才杀 / 隧道抖撑满窗口」。
+
+**教训**：
+1. **探针要想可信，它依赖的中间层必须先确认存活**——「用 X 证明 Y 通」隐含了「X 还在工作」，中间层没了探针就假失败。
+2. **修复动作要对症**：TProxy 掉了该「重启 v2raya 重挂」，不是「杀 v2raya fail-open」——后者恰好停在错误一侧。
+3. **DHCP 续租、Tailscale 重排路由都会动 ip rule**，是 TProxy 的隐形敌人；这类系统事件值得进看门狗的检查清单。
+
 ---
 
 ## 6. 排错速查表（症状 → 原因 → 解法）
@@ -220,8 +240,9 @@ v2raya-watchdog[294649]: proxy path down (last='000'); stopping v2raya to fail o
 | Mac 在国内却 `relay "sfo"`、延迟 400ms+ | **Mac 的 v2rayA 全局/Tun 代理把 Tailscale 送去了美国节点** | 断开 Mac 的 v2rayA，或切系统代理模式，或白名单放行 `100.64.0.0/10`（第 2.2 节） |
 | `direct connection not established`，走 relay | NAT 太硬（手机热点 CGNAT）打不了洞 | 客户端换家用宽带；两台连同一 WiFi 直接局域网直连；路由器开 UPnP |
 | 连不上、超时 | 被连方 ufw 挡了 4000 / 填了对方内网 IP | `ufw allow 4000/tcp,udp`；主机地址填对方 `100.x` |
-| 面板 `127.0.0.1:2017` 打不开，服务 inactive | **看门狗误杀**：探针含 DNS 腿，一次瞬断即停服；停后故意不自动重连 | `journalctl -t v2raya-watchdog` 看是否有 `proxy path down`；`systemctl start v2raya`；换 v2 探针（第 5 节 + 5.1） |
+| 面板 `127.0.0.1:2017` 打不开，服务 inactive | **看门狗误杀**：探针含 DNS 腿（5.1）或 TProxy 被冲（5.2），一次瞬断即停服 | `journalctl -t v2raya-watchdog` 看是否有 `proxy path down` / `tunnel down`；`systemctl start v2raya`；用 v3 探针（第 5 节 + 5.1/5.2） |
 | 看门狗日志只有 `last='000'` | `000` = 没拿到状态码，DNS 失败/超时不可区分 | 改用纯 IP 探针，并记录 `probe failed N/4` 中间态 |
+| 日志 `tunnel down x4 while node ... still reachable` 但节点明明好的 | **TProxy 被冲**：ip rule/nft 表被 DHCP 续租或 Tailscale 重排删掉，探针假失败 | `ip rule show` 看有无 `fwmark 0xc0 lookup 100`；有则 TProxy 在、是别的问题，无则说明被冲——v3 会自动重启 v2raya 重建；用 v3 脚本 |
 | `stop v2raya` 时 `nft delete table` 报 `No such file or directory` | 表在 stop 前已不存在（xray 先自己崩了），`ExecStopPost` 的 `-` 前缀已忽略返回值 | **无害**，可忽略 |
 | `nft list table inet v2raya` 报 `Operation not permitted` | 非 root 读不到 netlink，**不代表表不存在** | 加 `sudo`；或用 `curl https://1.1.1.1/cdn-cgi/trace` 看出口 IP 判断 TProxy 是否生效 |
 | 画面糊/慢但不断 | NoMachine 画质设太高 | Display 画质拉到 speed、开硬件编码、降分辨率/色深 |

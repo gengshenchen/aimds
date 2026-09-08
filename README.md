@@ -9,7 +9,7 @@
 |---|---|---|
 | [proxy-runbook.md](proxy-runbook.md) | 科学上网 | VLESS+REALITY 服务端搭建 + v2rayA 客户端 TProxy 分流 / DNS 分流 / 崩溃兜底，含验证与排错速查表 |
 | [proxy-runbook-almalinux9.md](proxy-runbook-almalinux9.md) | 科学上网 | 上篇的 AlmaLinux/RHEL 9 服务端适配 + [一键脚本](scripts/vps-bootstrap-almalinux9.sh)：dnf/firewalld 差异、`run -test` 骗过校验的权限坑、远程改火墙的死人开关 |
-| [tailscale-remote-runbook.md](tailscale-remote-runbook.md) | 远程桌面 | Tailscale + v2rayA 共存跑 NoMachine 远程：避免 Tailscale 被代理绕路、直连/中继判读、节点失败[看门狗](scripts/v2raya-node-watchdog.sh)兜底（含误杀复盘）|
+| [tailscale-remote-runbook.md](tailscale-remote-runbook.md) | 远程桌面 | Tailscale + v2rayA 共存跑 NoMachine 远程：避免 Tailscale 被代理绕路、直连/中继判读、节点失败[看门狗](scripts/v2raya-node-watchdog.sh)兜底（含两代误杀复盘 5.1/5.2）|
 <!-- 新增文档后在上面加一行 -->
 
 ## 🧭 使用方式
