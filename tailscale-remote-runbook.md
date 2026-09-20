@@ -128,17 +128,19 @@ tailscale ping <对端Tailscale-IP或设备名>
 
 `/usr/local/bin/v2raya-node-watchdog.sh` → **[scripts/v2raya-node-watchdog.sh](scripts/v2raya-node-watchdog.sh)**（脚本较长，独立成文件，别再内联抄）。
 
-判据分四层，缺一层就会误杀或漏杀。**第 2 层是关键**——它修正了 v2 的缺陷：v2 把「隧道探测」（层 3）和「TProxy 劫持」耦合，一旦 TProxy 的 ip rule 被 DHCP 续租 / Tailscale 重排冲掉，探针必然失败，v2 误判隧道故障、fail-open 杀了 v2raya——而杀 v2raya 恰恰无法恢复 TProxy（只有重启 v2raya 才重挂）。v3 新增「TProxy 存活检查」，发现 TProxy 掉了就**重启 v2raya 自愈**，而不是杀服务（详见 5.2）：
+判据分层防御，缺一层就会误杀或漏杀。v4 完整实现了**「TProxy重建自愈 → 进程重启自愈 → 故障开路停服 → 后台退避自动复活」**的完整闭环（详见 5.1/5.2/5.3）：
 
 | 层 | 探测 | 失败含义 | 动作 |
 |---|---|---|---|
-| 1 本地链路 | TCP `223.5.5.5:443`（geoip:cn→直连） | 是本机/ISP 断网，**不是节点的错** | 不停服（停了链路恢复时反而没代理） |
+| 1 本地链路 | TCP `223.5.5.5:443` 或 `119.29.29.29:443`（geoip:cn→直连） | 是本机/ISP 断网，**不是节点的错** | 不停服、不累计（停了链路恢复时反而没代理） |
 | 2 TProxy 存活 | `ip rule` 有 `fwmark 0xc0 lookup 100` 且 `nft inet v2raya` 表在 | TProxy 被 DHCP/Tailscale 重排冲掉（此时探针必假失败） | **重启 v2raya 重建**，不计数、不杀（60s 限速防抖） |
-| 3 隧道 | `curl https://1.1.1.1/cdn-cgi/trace` 回 `ip=`（前提：层 2 已确认 TProxy 在） | 非 CN 流量出不去 | 计数 +1 |
-| 4 节点 | TCP `<节点IP>:443`（routing rule 0 判直连） | 节点真死（会黑洞 Tailscale 的那种） | 2 次即 fail-open |
+| 3 隧道双探针 | `1.1.1.1/cdn-cgi/trace`（失败回退 `1.0.0.1`）回 `ip=` | 非 CN 流量出不去 | 计数 +1 |
+| 4 自愈预处理 | 节点 TCP 通，但探针连败 3 次 | xray 内部连接池假死 / socket 泄漏 | **先重启 v2raya 尝试自愈一次** |
+| 5 节点与开路 | TCP `<节点IP>:443` 死（2 次）或撑满 `KILL_AFTER=5`（~3.5 分钟）仍失败 | 节点真死 / 跨国隧道彻底阻断 | **fail-open 停服**（`stop v2raya` 删表保直连） |
+| 6 自动复活 | 处于 fail-open 期间，后台持续探测节点 TCP | 远端节点或网络已恢复 | **退避唤醒验证并恢复 v2raya（Fail-Back）** |
 
-- **探针必须用纯 IP**。`1.1.1.1` 在国内直连被墙、又不属 `geoip:cn`，所以「有响应」= 隧道通，且**全程不碰 DNS**。但前提是 TProxy 把 `1.1.1.1:443` 劫持进了 proxy——这正是层 2 要守护的：TProxy 不在时，纯 IP 探针会「假失败」，绝不能据此判隧道故障。
-- 节点通而只是隧道抖（证书/UUID/被 QoS），撑满 `KILL_AFTER=4` 次（45s 一轮 ≈ 3 分钟）才停。
+- **探针必须用纯 IP**。`1.1.1.1` 与 `1.0.0.1` 在国内直连被墙、又不属 `geoip:cn`，所以「有响应」= 隧道通，且**全程不碰 DNS**。但前提是 TProxy 把它们劫持进了 proxy——这正是层 2 要守护的：TProxy 不在时，纯 IP 探针会「假失败」，绝不能据此判隧道故障。
+- **Fail-Back 自动闭环**：v4 彻底解决了 v2/v3「只杀不救」的痛点。当因故障触发停服后，看门狗在后台按退避周期（90s ~ 600s）持续测试节点；节点与隧道一旦恢复，自动重启拉起 v2rayA 恢复透明代理，不再需要人工到场手动拉起。
 - 失败计数存 `/run/v2raya-watchdog.fails`，**跨 timer 周期累计**，单轮瞬断不再构成死刑。
 
 `/etc/systemd/system/v2raya-watchdog.service`：
@@ -164,7 +166,7 @@ WantedBy=timers.target
 启用：
 ```bash
 sudo install -m755 scripts/v2raya-node-watchdog.sh /usr/local/bin/v2raya-node-watchdog.sh
-sudo cp v2raya-watchdog.service v2raya-watchdog.timer /etc/systemd/system/
+sudo cp scripts/v2raya-watchdog.service scripts/v2raya-watchdog.timer /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable --now v2raya-watchdog.timer
 ```
 **装之前先确认探针在你的链路上成立**（不成立就别装，否则等于装了个定时炸弹）：
@@ -177,12 +179,12 @@ curl -s --max-time 8 https://1.1.1.1/cdn-cgi/trace | grep -E '^(ip|loc)='
 sudo /usr/local/bin/v2raya-node-watchdog.sh; echo "退出码=$?"
 systemctl is-active v2raya; cat /run/v2raya-watchdog.fails   # 期望 active / 0
 ```
-日常观察（v2 只在失败时说话，能看到中间态而非只在死后留一行）：
+日常观察（v4 只在失败或自愈时说话，能看到中间态而非只在死后留一行）：
 ```bash
 journalctl -t v2raya-watchdog -f
-# probe failed 2/4 (node <节点IP> dead=0); waiting
+# probe failed 2/5 (node <节点IP> dead=0); waiting
 ```
-> 停后**不自动重连**（故意：失败永远倒向“能上网/能远程”）。节点恢复后手动 `sudo systemctl start v2raya`。
+> **自动自愈与复活（Fail-Back）**：停服直连后，看门狗在后台持续监控，节点网络恢复后会自动重启唤醒 v2rayA；若紧急需要也可随时手动 `sudo systemctl start v2raya`。
 
 ### 5.1 复盘：看门狗自己成了故障源（2026-09-05）
 
@@ -231,6 +233,32 @@ v2raya-watchdog[294649]: proxy path down (last='000'); stopping v2raya to fail o
 2. **修复动作要对症**：TProxy 掉了该「重启 v2raya 重挂」，不是「杀 v2raya fail-open」——后者恰好停在错误一侧。
 3. **DHCP 续租、Tailscale 重排路由都会动 ip rule**，是 TProxy 的隐形敌人；这类系统事件值得进看门狗的检查清单。
 
+### 5.3 复盘：v3 只有 fail-open 没有 fail-back，短抖动导致永久停服（2026-09-14）
+
+**症状**：周一过来发现 v2rayA 停服，已瘫痪超过 25 小时（周日早 08:24 停服，直到周一 09:47 人工拉起）。
+
+**日志证据**（`journalctl -t v2raya-watchdog`）：
+```
+Sep 13 08:22:19 v2raya-watchdog: probe failed 1/4 (node <节点IP> dead=0); waiting
+Sep 13 08:23:09 v2raya-watchdog: probe failed 2/4 (node <节点IP> dead=0); waiting
+Sep 13 08:23:59 v2raya-watchdog: probe failed 3/4 (node <节点IP> dead=0); waiting
+Sep 13 08:24:46 v2raya-watchdog: tunnel down x4 while node <节点IP>:443 still reachable; stopping v2raya to fail open
+```
+
+**根因**：
+1. **只杀不救（缺乏 Fail-Back 恢复机制）**：v3 脚本在开头判断 `systemctl is-active --quiet v2raya || reset`。一旦看门狗触发 `systemctl stop v2raya`，后续周期检测到服务未运行就直接重置并退出，**完全不再探测节点，也绝不会自动重新拉起服务**。这意味着只要周末清晨发生一次短短 2~3 分钟的网络抖动（如运营商 PPPoE 例行重拨或跨国路由抖动），v2rayA 就会永久躺平，直到人工手动启动。
+2. **缺乏进程自愈预处理**：节点 TCP 443 一直是通的（`dead=0`），有时仅仅是 xray 内部连接池假死或 socket 阻塞，v3 却直接 `stop` 放弃治疗，没有给进程一次 `restart` 原地自愈的机会。
+3. **单点探针与阈值偏紧**：仅依赖单一 `1.1.1.1`，4 次（约 2 分 15 秒）容忍度对跨太平洋线路偏窄。
+
+**修复（v4）**：
+1. **引入 Fail-Back 状态机**：进入 fail-open 后在 `/run` 保留标记，后台以指数退避周期（90s、150s、210s... 最大 600s）持续检测节点 TCP；只要节点可达且隧道探针通过，**自动拉起 v2rayA 恢复代理**。
+2. **先 Restart 尝试自愈**：在达到停服阈值前（第 3 次失败），先尝试 `systemctl restart v2raya` 一次。若自愈成功则继续工作；自愈失败才进入 fail-open。
+3. **双探针冗余**：优先探测 `1.1.1.1`，超时自动回退复核 `1.0.0.1`；本地直连增加腾讯 DNS（`119.29.29.29`）与阿里 DNS 双通道。
+
+**教训**：
+1. **任何故障保护都必须闭环**：有 fail-open 就必须有 fail-back，否则临时保护就会变成永久故障。
+2. **杀停之前先给自愈机会**：进程内部假死往往可以通过重启原地解决，不需要直接拉闸全机网络。
+
 ---
 
 ## 6. 排错速查表（症状 → 原因 → 解法）
@@ -240,9 +268,9 @@ v2raya-watchdog[294649]: proxy path down (last='000'); stopping v2raya to fail o
 | Mac 在国内却 `relay "sfo"`、延迟 400ms+ | **Mac 的 v2rayA 全局/Tun 代理把 Tailscale 送去了美国节点** | 断开 Mac 的 v2rayA，或切系统代理模式，或白名单放行 `100.64.0.0/10`（第 2.2 节） |
 | `direct connection not established`，走 relay | NAT 太硬（手机热点 CGNAT）打不了洞 | 客户端换家用宽带；两台连同一 WiFi 直接局域网直连；路由器开 UPnP |
 | 连不上、超时 | 被连方 ufw 挡了 4000 / 填了对方内网 IP | `ufw allow 4000/tcp,udp`；主机地址填对方 `100.x` |
-| 面板 `127.0.0.1:2017` 打不开，服务 inactive | **看门狗误杀**：探针含 DNS 腿（5.1）或 TProxy 被冲（5.2），一次瞬断即停服 | `journalctl -t v2raya-watchdog` 看是否有 `proxy path down` / `tunnel down`；`systemctl start v2raya`；用 v3 探针（第 5 节 + 5.1/5.2） |
-| 看门狗日志只有 `last='000'` | `000` = 没拿到状态码，DNS 失败/超时不可区分 | 改用纯 IP 探针，并记录 `probe failed N/4` 中间态 |
-| 日志 `tunnel down x4 while node ... still reachable` 但节点明明好的 | **TProxy 被冲**：ip rule/nft 表被 DHCP 续租或 Tailscale 重排删掉，探针假失败 | `ip rule show` 看有无 `fwmark 0xc0 lookup 100`；有则 TProxy 在、是别的问题，无则说明被冲——v3 会自动重启 v2raya 重建；用 v3 脚本 |
+| 面板 `127.0.0.1:2017` 打不开，服务 inactive | **看门狗误杀**：探针含 DNS 腿（5.1）、TProxy 被冲（5.2），或无恢复机制（5.3） | `journalctl -t v2raya-watchdog` 看是否有 `tunnel down`；`systemctl start v2raya`；换用具备自动复活的 v4 脚本（第 5 节） |
+| 看门狗日志只有 `last='000'` | `000` = 没拿到状态码，DNS 失败/超时不可区分 | 改用纯 IP 探针，并记录 `probe failed N/5` 中间态 |
+| 日志 `tunnel down x4/x5 while node ... still reachable` 但节点明明好的 | **短抖动触发停服或 TProxy 被冲**：v3 缺乏自动复活机制 | 升级至 v4 脚本，具备先 restart 自愈以及后台退避自动唤醒（Fail-Back）能力 |
 | `stop v2raya` 时 `nft delete table` 报 `No such file or directory` | 表在 stop 前已不存在（xray 先自己崩了），`ExecStopPost` 的 `-` 前缀已忽略返回值 | **无害**，可忽略 |
 | `nft list table inet v2raya` 报 `Operation not permitted` | 非 root 读不到 netlink，**不代表表不存在** | 加 `sudo`；或用 `curl https://1.1.1.1/cdn-cgi/trace` 看出口 IP 判断 TProxy 是否生效 |
 | 画面糊/慢但不断 | NoMachine 画质设太高 | Display 画质拉到 speed、开硬件编码、降分辨率/色深 |

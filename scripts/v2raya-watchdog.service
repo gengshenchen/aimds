@@ -1,0 +1,7 @@
+[Unit]
+Description=v2rayA node health watchdog (fail-open to direct if proxy dead)
+After=v2raya.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/v2raya-node-watchdog.sh

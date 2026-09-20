@@ -1,0 +1,10 @@
+[Unit]
+Description=Run v2rayA node watchdog periodically
+
+[Timer]
+OnBootSec=60s
+OnUnitActiveSec=45s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target
