@@ -10,6 +10,7 @@
 | [proxy-runbook.md](proxy-runbook.md) | 科学上网 | VLESS+REALITY 服务端搭建 + v2rayA 客户端 TProxy 分流 / DNS 分流 / 崩溃兜底，含验证与排错速查表 |
 | [proxy-runbook-almalinux9.md](proxy-runbook-almalinux9.md) | 科学上网 | 上篇的 AlmaLinux/RHEL 9 服务端适配 + [一键脚本](scripts/vps-bootstrap-almalinux9.sh)：dnf/firewalld 差异、`run -test` 骗过校验的权限坑、远程改火墙的死人开关 |
 | [tailscale-remote-runbook.md](tailscale-remote-runbook.md) | 远程桌面 | Tailscale + v2rayA 共存跑 NoMachine 远程：避免 Tailscale 被代理绕路、直连/中继判读、节点失败[看门狗](scripts/v2raya-node-watchdog.sh)兜底（含三代误杀复盘 5.1/5.2/5.3，v4 自动复活）|
+| [markdown-to-pdf-runbook.md](markdown-to-pdf-runbook.md) | 文档工程 | Markdown 转出版级 A4 PDF：基于 Chrome Headless + 离线 Mermaid 矢量引擎，解决跨页截断、代码块前大片空白与排版踩坑速查，含[一键安装与转换脚本](scripts/md2pdf.py) |
 <!-- 新增文档后在上面加一行 -->
 
 ## 🧭 使用方式
