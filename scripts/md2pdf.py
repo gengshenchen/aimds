@@ -33,6 +33,40 @@ def find_mermaid_js() -> str:
             return f"file://{c.resolve()}"
     return "https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"
 
+def normalize_fenced_code(text: str) -> str:
+    """确保所有代码块 (``` 或 ~~~) 顶格对齐，防止 python-markdown 因缩进解析失败导致代码挤成一团"""
+    lines = text.split('\n')
+    new_lines = []
+    in_fence = False
+    fence_indent = 0
+    fence_char = ''
+    for line in lines:
+        if not in_fence:
+            m_start = re.match(r'^([ \t]*)(`{3,}|~{3,})([^\n]*)$', line)
+            if m_start:
+                in_fence = True
+                fence_indent = len(m_start.group(1))
+                fence_char = m_start.group(2)[0]
+                new_lines.append(m_start.group(2) + m_start.group(3))
+                continue
+            new_lines.append(line)
+        else:
+            m_end = re.match(r'^[ \t]*(`{3,}|~{3,})[ \t]*$', line)
+            if m_end and m_end.group(1).startswith(fence_char):
+                in_fence = False
+                new_lines.append(m_end.group(1))
+                continue
+            if fence_indent > 0:
+                if line.startswith(' ' * fence_indent):
+                    new_lines.append(line[fence_indent:])
+                elif line.startswith('\t' * fence_indent):
+                    new_lines.append(line[fence_indent:])
+                else:
+                    new_lines.append(line)
+            else:
+                new_lines.append(line)
+    return '\n'.join(new_lines)
+
 def convert_md_to_pdf(md_file: Path, pdf_file: Path = None, timeout_sec: int = 20) -> bool:
     if not md_file.exists():
         print(f"错误: Markdown 文件不存在: {md_file}", file=sys.stderr)
@@ -52,6 +86,9 @@ def convert_md_to_pdf(md_file: Path, pdf_file: Path = None, timeout_sec: int = 2
         return f"PHMERMAIDBLOCK{idx}ENDPH"
 
     content_with_placeholders = re.sub(r"```mermaid\s+(.*?)```", save_mermaid, md_content, flags=re.S)
+
+    # 1.1 规范化通用代码块缩进（防止列表中的嵌套代码块被 python-markdown 误判为内联文本挤成一团）
+    content_with_placeholders = normalize_fenced_code(content_with_placeholders)
 
     # 2. 预处理 Markdown 规范格式（符号规整、防序号挤在一块）
     content_with_placeholders = re.sub(r'\\?ightarrow\$?', '→', content_with_placeholders)
@@ -242,11 +279,13 @@ def convert_md_to_pdf(md_file: Path, pdf_file: Path = None, timeout_sec: int = 2
   pre {{
     background-color: #f6f8fa;
     border: 1px solid #e1e4e8;
-    border-radius: 5px;
-    padding: 9px 12px;
+    border-radius: 6px;
+    margin: 12px 0 16px 0;
+    padding: 12px 14px;
     font-family: "JetBrains Mono", "SFMono-Regular", Consolas, Menlo, "Noto Sans Mono CJK SC", monospace;
-    font-size: 8.5pt;
-    line-height: 1.45;
+    font-size: 8.8pt;
+    line-height: 1.6;
+    letter-spacing: 0.02em;
     white-space: pre-wrap !important;
     word-break: normal !important;
     overflow-wrap: break-word !important;
@@ -257,9 +296,9 @@ def convert_md_to_pdf(md_file: Path, pdf_file: Path = None, timeout_sec: int = 2
 
   code {{
     font-family: "JetBrains Mono", "SFMono-Regular", Consolas, Menlo, "Noto Sans Mono CJK SC", monospace;
-    font-size: 8.5pt;
-    background-color: rgba(27,31,35,0.05);
-    padding: 0.15em 0.35em;
+    font-size: 8.8pt;
+    background-color: rgba(27,31,35,0.06);
+    padding: 0.2em 0.4em;
     border-radius: 3px;
   }}
 
@@ -267,6 +306,8 @@ def convert_md_to_pdf(md_file: Path, pdf_file: Path = None, timeout_sec: int = 2
     background-color: transparent;
     padding: 0;
     border-radius: 0;
+    font-size: 8.8pt;
+    line-height: 1.6;
   }}
 
   .mermaid-wrapper {{

@@ -97,6 +97,10 @@ md2pdf <input.md> <output.pdf> --timeout 30
 * 页面尺寸严格固定为国际标准 A4：`@page { size: A4 portrait; margin: 16mm 14mm 16mm 14mm; }`。
 * 字体层叠：优先调用系统无衬线抗锯齿字体族（PingFang SC, Noto Sans CJK SC, Microsoft YaHei），代码块采用 JetBrains Mono / SFMono，确保在 Linux、macOS 与 Windows 跨平台渲染一致。
 
+### 3.4 列表内代码块顶格归一化自适应与防挤压
+* **痛点**：在编写工程文档时，常在有序或无序列表子条目中嵌入代码块（前面带有 2~6 个空格缩进）。`python-markdown` 的 `fenced_code` 扩展默认仅匹配行首围栏，缩进超过 3 个空格时无法识别为独立代码块，会将反引号（```` ``` ````）及多行代码折叠为单行普通文本输出，造成严重挤压与语法泄露。
+* **解法**：脚本内置 `normalize_fenced_code` 归一化层，在 Markdown 解析前自动将各类嵌套缩进的代码块围栏顶格对齐，并等比消除公共缩进；同时优化代码样式至 `line-height: 1.6`、`margin: 12px 0 16px 0`，确保代码段结构清晰且视觉透气。
+
 ---
 
 ## 4. 关键步骤验证与测试
@@ -145,3 +149,4 @@ ls -lh /tmp/test_render.pdf
 | 长表格右侧列被截断在页面外 | 表格列数过多或单列包含无空格长字符串破坏换行 | 在表格对应列中使用 `<br>` 手工换行，或在 CSS 中确保 `table { word-break: break-word; }` 生效 |
 | 生成的 PDF 尾部出现一两页完全空白的页面 | 打印 CSS 中有浮动元素高度溢出触发打印机边界换页 | 检查 Markdown 末尾是否有连续空行，或确保使用最新版 `md2pdf.py`（已清空末尾孤立边距） |
 | 特殊符号如 `\rightarrow` 被转换为奇怪字符 | Markdown 解析器误将 LaTeX 符号按转义字符吃掉 | 脚本已包含输入规整层，自动将 `\rightarrow` 与 `$\rightarrow$` 提前转换为 Unicode 字符 `→` |
+| 列表内代码块反引号泄露或整段代码挤成一行 | `python-markdown` 默认对缩进代码围栏解析异常 | 脚本已内置 `normalize_fenced_code` 自动将缩进代码块顶格归一化，确保生成独立语法高亮代码块 |
