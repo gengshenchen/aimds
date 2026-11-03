@@ -7,6 +7,8 @@
 #   RE_BIN     自定义 realesrgan-ncnn-vulkan 可执行文件路径
 #   TOOL_DIR   Mac 上 sr_tool 目录（含二进制和全套模型），默认 ~/gezai_restore/sr_tool
 #   TILE/JOBS  手动覆盖自动调优（如 TILE=256 降显存）
+#   CRF        输出质量（默认 17；空间紧张可用 20，体积约省 55%）
+#   NOISE_S    颗粒强度 alls（默认 3；2 约再省 20-30%，颗粒感略减）
 # 三阶段: ffmpeg 清洗(deblock+hqdn3d→854x480) → Real-ESRGAN x4 超分 → 1080p x264 crf17+颗粒
 # 断点续跑: 输出已存在则跳过；.stage1_done 跳过抽帧；frames_out 数量不够才跑超分；换模型自动重跑超分
 set -uo pipefail
@@ -136,8 +138,8 @@ for f in "${FILES[@]}"; do
   ac=$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of csv=p=0 "$f")
   if [ "$ac" = "aac" ]; then A="-c:a copy"; else A="-c:a aac -b:a 160k"; fi
   ffmpeg -hide_banner -y -framerate "$fps" -i "$W/frames_out/%06d.jpg" -i "$f" \
-    -vf "scale=1920:1080:flags=lanczos,noise=alls=3:allf=t" \
-    -map 0:v -map "1:a?" -c:v libx264 -crf 17 -preset medium -pix_fmt yuv420p $A "$out" \
+    -vf "scale=1920:1080:flags=lanczos,noise=alls=${NOISE_S:-3}:allf=t" \
+    -map 0:v -map "1:a?" -c:v libx264 -crf ${CRF:-17} -preset medium -pix_fmt yuv420p $A "$out" \
     || { echo "  FAIL mux"; exit 1; }
   rm -rf "$W"
   echo "  DONE -> $out"

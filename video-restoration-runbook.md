@@ -24,6 +24,7 @@ git clone git@github.com:gengshenchen/aimds.git && cd aimds
 - 不给输出目录时：默认 `/Volumes/Elements/歌仔戏修复/`（不存在则 `~/video_restore_out/`）
 - 单文件也行：`./scripts/video-restore.sh /path/to/第01集.mp4`
 - 换细节版模型：`SR_MODEL=realesrgan-x4plus ./scripts/video-restore.sh ...`（慢约 13 倍，对已跑集数自动重跑超分阶段，不混用）
+- 成品体积旋钮：`CRF=20 NOISE_S=2 ./scripts/video-restore.sh ...`（默认 `17`/`3` 存档级；`20`/`2` 约省 60~70% 体积，正常观看基本无差别，见 §8 FAQ）
 
 ## 2. 三阶段流水线（为什么这么设计）
 
@@ -140,6 +141,7 @@ ffmpeg -ss 00:10:00 -i 某集_fixed/第01集.mp4 -frames:v 1 /tmp/b.png && open 
 | 画面太"糊/塑料"或太锐 | 模型观感不合口味 | `SR_MODEL=realesrgan-x4plus` 切细节版（或换回默认） |
 | 集数中断想继续 | —— | 直接重跑同一条命令，自动续 |
 | 磁盘爆 | `.work` 峰值大 | 换大容量输出盘；删 `.work` 会丢进度重抽帧 |
+| 成品太大/硬盘装不下 | crf17+全额颗粒码率高 | `CRF=20 NOISE_S=2` 重跑（约 -60~70%；44min/集 3.4G→1.4G，输出文件存在不会自动重编码，需先删旧成品） |
 
 ## 9. 本机部署状态（karl 的 Mac）
 
