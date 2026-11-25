@@ -128,19 +128,19 @@ tailscale ping <对端Tailscale-IP或设备名>
 
 `/usr/local/bin/v2raya-node-watchdog.sh` → **[scripts/v2raya-node-watchdog.sh](scripts/v2raya-node-watchdog.sh)**（脚本较长，独立成文件，别再内联抄）。
 
-判据分层防御，缺一层就会误杀或漏杀。v4 完整实现了**「TProxy重建自愈 → 进程重启自愈 → 故障开路停服 → 后台退避自动复活」**的完整闭环（详见 5.1/5.2/5.3）：
+判据分层防御，缺一层就会误杀或漏杀。**v5（防封熔断安全版）**在保留「TProxy 重建自愈 → 进程重启自愈 → 故障开路停服 → 后台退避自动复活」闭环的基础上，彻底去掉了易触发 GFW 风控的 45 秒机械心跳与 0 字节裸 TCP 握手，并新增**疑似被墙自动熔断停探**（详见 5.1/5.2/5.3/5.4）：
 
 | 层 | 探测 | 失败含义 | 动作 |
 |---|---|---|---|
 | 1 本地链路 | TCP `223.5.5.5:443` 或 `119.29.29.29:443`（geoip:cn→直连） | 是本机/ISP 断网，**不是节点的错** | 不停服、不累计（停了链路恢复时反而没代理） |
 | 2 TProxy 存活 | `ip rule` 有 `fwmark 0xc0 lookup 100` 且 `nft inet v2raya` 表在 | TProxy 被 DHCP/Tailscale 重排冲掉（此时探针必假失败） | **重启 v2raya 重建**，不计数、不杀（60s 限速防抖） |
-| 3 隧道双探针 | `1.1.1.1/cdn-cgi/trace`（失败回退 `1.0.0.1`）回 `ip=` | 非 CN 流量出不去 | 计数 +1 |
-| 4 自愈预处理 | 节点 TCP 通，但探针连败 3 次 | xray 内部连接池假死 / socket 泄漏 | **先重启 v2raya 尝试自愈一次** |
-| 5 节点与开路 | TCP `<节点IP>:443` 死（2 次）或撑满 `KILL_AFTER=5`（~3.5 分钟）仍失败 | 节点真死 / 跨国隧道彻底阻断 | **fail-open 停服**（`stop v2raya` 删表保直连） |
-| 6 自动复活 | 处于 fail-open 期间，后台持续探测节点 TCP | 远端节点或网络已恢复 | **退避唤醒验证并恢复 v2raya（Fail-Back）** |
+| 3 隧道双探针 | `1.1.1.1/cdn-cgi/trace`（失败回退 `1.0.0.1`）回 `ip=` | 非 CN 流量出不去（每 3~4.5 分钟随机触发） | 计数 +1 |
+| 4 自愈预处理 | 探针连败 2 次 | xray 内部连接池假死 / socket 泄漏 | **先重启 v2raya 尝试自愈一次** |
+| 5 开路停服 | 撑满 `KILL_AFTER=3`（~10~13 分钟）仍失败 | 节点真死 / 跨国隧道阻断 | **fail-open 停服**（`stop v2raya` 删表保直连） |
+| 6 退避复活与熔断 | 处于 fail-open 期间，按 `5m→10m→20m→40m→60m` 仅走正规握手试探，**最多 6 次** | 远端恢复则拉起；连续 6 次失败（~3 小时）疑似 IP 被墙 | 恢复即拉起；满 6 次**熔断彻底停探**（不再撞墙，人工修复后自动解除） |
 
 - **探针必须用纯 IP**。`1.1.1.1` 与 `1.0.0.1` 在国内直连被墙、又不属 `geoip:cn`，所以「有响应」= 隧道通，且**全程不碰 DNS**。但前提是 TProxy 把它们劫持进了 proxy——这正是层 2 要守护的：TProxy 不在时，纯 IP 探针会「假失败」，绝不能据此判隧道故障。
-- **Fail-Back 自动闭环**：v4 彻底解决了 v2/v3「只杀不救」的痛点。当因故障触发停服后，看门狗在后台按退避周期（90s ~ 600s）持续测试节点；节点与隧道一旦恢复，自动重启拉起 v2rayA 恢复透明代理，不再需要人工到场手动拉起。
+- **v5 防封三大红线**：① **绝不**对远端节点 443 发起 `</dev/tcp/IP/443` 裸 TCP 握手（0 字节即断强特征）；② timer 改为 **180s + 90s 随机抖动**消除机械周期心跳；③ Fail-Back 满 **6 次自动熔断静默**，避免无限撞墙刷新 GFW 封锁计时器。
 - 失败计数存 `/run/v2raya-watchdog.fails`，**跨 timer 周期累计**，单轮瞬断不再构成死刑。
 
 `/etc/systemd/system/v2raya-watchdog.service`：
@@ -155,11 +155,12 @@ ExecStart=/usr/local/bin/v2raya-node-watchdog.sh
 `/etc/systemd/system/v2raya-watchdog.timer`：
 ```ini
 [Unit]
-Description=Run v2rayA node watchdog periodically
+Description=Run v2rayA node watchdog periodically (v5 anti-detection cadence)
 [Timer]
-OnBootSec=60s
-OnUnitActiveSec=45s
-AccuracySec=5s
+OnBootSec=120s
+OnUnitActiveSec=180s
+RandomizedDelaySec=90s
+AccuracySec=15s
 [Install]
 WantedBy=timers.target
 ```
@@ -258,6 +259,20 @@ Sep 13 08:24:46 v2raya-watchdog: tunnel down x4 while node <节点IP>:443 still 
 **教训**：
 1. **任何故障保护都必须闭环**：有 fail-open 就必须有 fail-back，否则临时保护就会变成永久故障。
 2. **杀停之前先给自愈机会**：进程内部假死往往可以通过重启原地解决，不需要直接拉闸全机网络。
+
+### 5.4 复盘：v4 高频 45s 心跳 + 裸 TCP 空握手触发风控 & 阻碍解封（2026-11）
+
+**背景**：搬瓦工 VPS 一个月内连续两次被 GFW 封禁 IPv4，排查本机 `journalctl -t v2raya-watchdog` 发现 v4 看门狗在节点故障后连续执行 `attempt 8 / 9 / 10 / 11...` 无上限循环拉起试探，且正常时段也严格每 45 秒发一次固定心跳。
+
+**根因（三个隐形抗封锁硬伤）**：
+1. **7×24 小时固定 45 秒机械心跳**：哪怕半夜无人操作，本机也在严格每 45 秒经代理请求一次完全相同字节数的 `https://1.1.1.1/cdn-cgi/trace`，属于强周期行为特征。
+2. **对 `:443` 发「0 字节裸 TCP 握手即断」**：`check_node_reachable` 用 `</dev/tcp/$n/$p` 完成 TCP 三次握手后**不发任何 TLS `ClientHello` 直接 FIN 断开**，正常浏览器绝不会这么访问 HTTPS 站点。
+3. **无熔断上限，阻碍自动解封**：IP 已被墙时，v4 仍按 600s 上限无限循环拉起 `v2raya` 撞墙，既持续制造异常连接，又不断刷新 GFW 封禁计时器（搬瓦工客服明确要求停掉一切触发流量才能等待自动解封）。
+
+**修复（v5 防封熔断版）**：
+1. **彻底删除 `</dev/tcp/$n/$p` 裸 TCP 探测**：恢复试探只通过 `v2raya` 发起正规完整 REALITY 握手。
+2. **周期拉长 + 随机抖动**：`v2raya-watchdog.timer` 改为 `OnUnitActiveSec=180s` + `RandomizedDelaySec=90s`（3~4.5 分钟随机间隔）。
+3. **增加熔断上限（Circuit Breaker）**：Fail-Back 指数退避改为 `5m → 10m → 20m → 40m → 60m → 60m`，连续失败 `MAX_RECOVER_ATTEMPTS=6` 次后写入 `/run/v2raya-watchdog.tripped` **彻底停止一切探测与拉起**，直到人工换节点/手动 `systemctl start v2raya` 且探针恢复后才自动解除。
 
 ---
 

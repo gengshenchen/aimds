@@ -44,24 +44,32 @@ bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release
 openssl rand -hex 8            # 记下 shortId
 ```
 
-### 1.3 写配置 `/usr/local/etc/xray/config.json`
-把下面 4 个 `<...>` 占位符替换成上一步生成的值。SNI 用一个 TLS1.3 的干净大站（推荐 `www.tesla.com` / `www.icloud.com`）。端口用 **443**（REALITY 就该伪装成正常 HTTPS）。
+### 1.3 选干净伪装目标并写配置 `/usr/local/etc/xray/config.json`
+> ⚠️ **踩坑警告（2026-11 实测）**：**绝不要再用 `www.tesla.com` / `www.icloud.com` 等 Akamai/Cloudflare 大 CDN 或全网默认 SNI！** 实测在搬瓦工 VPS 上直连 `www.tesla.com` 直接返回 `403 AkamaiGHost` + `alt-svc: h3`，既会暴露回落异常，又存在大 CDN 节点被扫描器白嫖反代连坐封 IP 的风险。
+> **正确选站标准**：国外**非大 CDN 独立站**（如就近高校镜像/小型技术站，示例 `mirrors.ocf.berkeley.edu`）、**TLS 1.3 + X25519 + H2**、**HTTP 200（无跳转、无 403 WAF、无 h3）**。先在 VPS 本机验货再写入：
+> ```bash
+> curl -4 -svI --tlsv1.3 --max-time 8 "https://<候选域名>/" 2>&1 \
+>   | grep -iE 'SSL connection|ALPN|HTTP/|server:|location:|alt-svc:'
+> ```
+
+把下面 4 个 `<...>` 占位符替换成上一步生成的值，端口固定 **443**（注意开启 NTP 校时以配合 `maxTimeDiff` 防重放，并配置服务端 `routing` 禁回国回环）：
 ```json
 {
   "log": { "loglevel": "warning" },
   "inbounds": [{
-    "listen": "0.0.0.0", "port": 443, "protocol": "vless",
+    "listen": "::", "port": 443, "protocol": "vless",
     "settings": {
       "clients": [{ "id": "<UUID>", "flow": "xtls-rprx-vision" }],
       "decryption": "none"
     },
     "streamSettings": {
-      "network": "tcp", "security": "reality",
+      "network": "raw", "security": "reality",
       "realitySettings": {
-        "show": false, "dest": "www.tesla.com:443", "xver": 0,
-        "serverNames": ["www.tesla.com"],
+        "show": false, "target": "<已验货的干净域名>:443", "xver": 0,
+        "serverNames": ["<已验货的干净域名>"],
         "privateKey": "<PRIVATE_KEY>",
-        "shortIds": ["<SHORT_ID>"]
+        "shortIds": ["<SHORT_ID>"],
+        "maxTimeDiff": 120000
       }
     },
     "sniffing": { "enabled": true, "destOverride": ["http","tls","quic"] }
@@ -69,12 +77,25 @@ openssl rand -hex 8            # 记下 shortId
   "outbounds": [
     { "protocol": "freedom", "tag": "direct" },
     { "protocol": "blackhole", "tag": "block" }
-  ]
+  ],
+  "routing": {
+    "domainStrategy": "IPIfNonMatch",
+    "rules": [
+      { "type": "field", "ip": ["geoip:private", "geoip:cn"], "outboundTag": "block" },
+      { "type": "field", "protocol": ["bittorrent"], "outboundTag": "block" }
+    ]
+  }
 }
 ```
+*(注：`"listen": "::"` 在 Linux 双栈下同时监听 IPv4 与 IPv6；新版 Xray 中 `"network": "raw"` 与 `"target"` 替代了旧别名 `tcp`/`dest`。)*
 
 ### 1.4 校验、放行端口、启动
 ```bash
+# 注意官方 systemd 单元 v26.11+ 为 User=xray（旧版 nobody），确保 640 权限对服务用户可读
+SVC_USER=$(awk -F= '/^User=/{print $2; exit}' /etc/systemd/system/xray.service)
+chown "root:${SVC_USER:-nobody}" /usr/local/etc/xray/config.json
+chmod 640 /usr/local/etc/xray/config.json
+
 /usr/local/bin/xray run -test -config /usr/local/etc/xray/config.json   # 必须 Configuration OK
 ufw status | grep -q active && ufw allow 443/tcp    # 若开了 ufw
 systemctl restart xray && systemctl enable xray
@@ -84,30 +105,31 @@ ss -tlnp | grep ':443 '             # xray 在监听 443
 
 ### 1.5 生成分享链接 / 二维码
 ```bash
-# 替换 <UUID> <PUBLIC_KEY> <SHORT_ID> <SERVER_IP>
-LINK='vless://<UUID>@<SERVER_IP>:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.tesla.com&fp=chrome&pbk=<PUBLIC_KEY>&sid=<SHORT_ID>&type=tcp&headerType=none#MYNODE'
+# 替换 <UUID> <PUBLIC_KEY> <SHORT_ID> <SERVER_IP> <SNI>
+LINK='vless://<UUID>@<SERVER_IP>:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=<SNI>&fp=chrome&pbk=<PUBLIC_KEY>&sid=<SHORT_ID>&type=raw&headerType=none#MYNODE'
 echo "$LINK"
 apt-get install -y qrencode && qrencode -t ANSIUTF8 "$LINK"   # 手机扫码导入
 ```
 
-### 1.6 服务端自测（关键：证明节点本身没问题）
-在服务器本机连它自己，绕开 GFW 和双重代理，验证 REALITY 参数正确：
+### 1.6 服务端自测（关键：证明节点正常 + 回国拦截生效）
+在服务器本机连它自己，绕开 GFW 和双重代理，验证 REALITY 参数与 `geoip:cn` 拦截正确：
 ```bash
 cat > /tmp/selftest.json <<EOF
 { "inbounds":[{"listen":"127.0.0.1","port":10999,"protocol":"socks","settings":{"udp":true}}],
-  "outbounds":[{"protocol":"vless","settings":{"vnext":[{"address":"<SERVER_IP>","port":443,
+  "outbounds":[{"protocol":"vless","settings":{"vnext":[{"address":"127.0.0.1","port":443,
     "users":[{"id":"<UUID>","encryption":"none","flow":"xtls-rprx-vision"}]}]},
-    "streamSettings":{"network":"tcp","security":"reality","realitySettings":{
-      "serverName":"www.tesla.com","fingerprint":"chrome","publicKey":"<PUBLIC_KEY>","shortId":"<SHORT_ID>"}}}]}
+    "streamSettings":{"network":"raw","security":"reality","realitySettings":{
+      "serverName":"<SNI>","fingerprint":"chrome","publicKey":"<PUBLIC_KEY>","shortId":"<SHORT_ID>"}}}]}
 EOF
 nohup /usr/local/bin/xray run -config /tmp/selftest.json >/tmp/selftest.log 2>&1 &
 sleep 3
 curl -s --socks5-hostname 127.0.0.1:10999 --max-time 12 -o /dev/null -w "google:%{http_code}\n" https://www.google.com
+curl -s --socks5-hostname 127.0.0.1:10999 --max-time 6  -o /dev/null -w "cn_block:%{http_code}\n" https://223.5.5.5
 pkill -f selftest.json; rm -f /tmp/selftest.json /tmp/selftest.log
-# 返回 google:200 → 节点 100% 正常
+# 期望: google:200（节点通） 且 cn_block:000（服务端禁回国生效）
 ```
 
-> ⚠️ 若客户端连不上但自测通过 → 多半是**客户端内核太旧**连不上过新的 Xray，升级客户端；或把服务端 Xray 换成与客户端同代的稳定版。
+> ⚠️ **客户端与服务端 Xray 内核必须保持同代**：不只是防兼容报错——老版客户端（如 `25.x` 连 `26.x`）的 uTLS `fp=chrome` 会发出过时的旧 Chrome 指纹，在 GFW 流量分析里非常突兀。同时务必核实客户端出站确实启用了 `flow=xtls-rprx-vision` 且 **关闭了 Mux**。
 
 ### 1.7 服务器加固（重装后必做——这次被黑就是缺这步）
 ```bash
@@ -135,7 +157,18 @@ apt-get install -y fail2ban && systemctl enable --now fail2ban
 apt-get update && apt-get -y upgrade
 ```
 > **绝不再装 3x-ui 等公网面板**——本手册用纯 Xray，没有面板就没有面板入口（本次入侵正是暴露的 3x-ui 面板被打）。若确实要面板，务必绑定 `127.0.0.1` 后用 SSH 隧道访问，绝不 `0.0.0.0` 对全网裸奔。
-> 验证加固：`ss -tlnp | grep -vE '127.0.0.1|::1'` 应只看到 22 和 443 在对外监听。
+> 验证加固：`ss -tlnp | grep -vE '127.0.0.1|::1'` 应只看到自定义 SSH 端口和 443 在对外监听。
+
+### 1.8 ★ 防封锁与换 IP 避坑铁律（2026-11 搬瓦工一月两封复盘）
+
+搬瓦工（`AS25820 IT7`）等热门机房本身属于 GFW 高敏盯防网段，以下 5 个配置/习惯隐患叠加会直接导致「换了新 IP 没多久又被封」：
+
+1. **绝不用 Akamai/Cloudflare 大站或全网烂大街默认 SNI**：旧手册写的 `www.tesla.com` 实测对搬瓦工 IP 直接返回 **`403 AkamaiGHost` + `h3`**（备选 `www.icloud.com` 也是 Akamai），既让主动探测拿到 WAF 异常响应，又可能被全网扫描器借回落白嫖 Akamai 反代连坐封 IP。选站必须用 VPS 本机 `curl` 验过 **`TLSv1.3 + X25519 + h2 + HTTP 200`** 的冷门非大 CDN 独立站（如美西高校镜像 `mirrors.ocf.berkeley.edu`）。
+2. **服务端必须禁回国流量（`geoip:cn`）+ 开 `maxTimeDiff`**：旧配置定义了 `blackhole` 却忘了写 `routing`，客户端一旦漏掉国内流量就会形成 `国内→VPS→国内` 对称穿透；无 `maxTimeDiff` 则不防重放探测。
+3. **停用/升级高频机械看门狗**：旧版 `v2raya-node-watchdog.sh (v4)` 每 45 秒固定心跳 + 频繁用 `</dev/tcp/IP/443` 发 **0 字节裸 TCP 握手立刻断开**，且封禁后持续循环撞墙导致封禁计时器不断刷新、永远等不到解封。已升级到 **v5 防封熔断版**（见 `tailscale-remote-runbook.md` 5.4）。
+4. **换 IP 前必做清洗，绝不原配置直接上新 IP**：搬瓦工付费换 IP 保留磁盘数据，若不换 SNI 和凭据等于把触发条件原样带到新 IP。换 IP 前应先停服、跑 `rotate` 轮换全套凭据与新 SNI、SSH 迁离 22 端口并关密码登录、绝不把曾指向被封 IP 的旧域名指到新 IP。
+5. **等自动解封必须彻底静默**：被封后若选择不花钱换 IP 而等解封，**务必同时在 VPS 上 `systemctl stop xray` + 在所有客户端断开该节点 + 确认看门狗已停**，让 443 端口彻底静默，避免主动探测或重连流量持续刷新封锁状态。
+6. **避免从搬瓦工 VPS 做网段端口扫描**：不要在搬瓦工上拿 `RealiTLScanner` 扫 `/24` 或 `/22`，易触发商家防扫描风控；直接针对少量候选域名做单次礼貌 `curl`/`openssl` 验货即可。
 
 ---
 
@@ -240,8 +273,9 @@ sudo systemctl start v2raya
 # 关键取值备忘（本次实例，换机需重新生成）
 
 - 服务端 nft 无关；**客户端 v2rayA 的 nft 表名 = `inet v2raya`**（兜底删表用）。
-- REALITY 端口固定 **443**，SNI `www.tesla.com`。
-- 凭据（UUID/PrivateKey/PublicKey/shortId）**每台服务器用 `xray x25519`/`uuid`/`openssl rand` 重新生成**，切勿跨机复用。
+- REALITY 端口固定 **443**，SNI 选**非大 CDN 且实测 200 的冷门独立站**（如 `mirrors.ocf.berkeley.edu`，**禁用 `www.tesla.com`/`www.icloud.com`**）。
+- 凭据（UUID/PrivateKey/PublicKey/shortId）**每台服务器及每次换 IP 必须重新生成**，切勿复用。
+- 客户端与服务端 Xray 内核保持同代（避免老版本 uTLS 指纹突兀），确认 `flow=xtls-rprx-vision` 且关闭 Mux。
 - 国内 DNS：`223.5.5.5`/`https://dns.alidns.com/dns-query`、`119.29.29.29`；国外 DNS：`https://1.1.1.1/dns-query`。
 
 ---
@@ -635,22 +669,22 @@ net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 
 # ---- 缓冲区: 匹配高延迟跨境链路 BDP ----
+# ★ 切勿硬写 net.ipv4.tcp_mem（单位是 4KB 内存页不是字节！旧版 786432=3GB 会让 1G 小鸡失去回收保护触发 OOM）
 net.core.rmem_max = 33554432
 net.core.wmem_max = 33554432
 net.core.rmem_default = 1048576
 net.core.wmem_default = 1048576
 net.ipv4.tcp_rmem = 4096 1048576 33554432
 net.ipv4.tcp_wmem = 4096 1048576 33554432
-net.ipv4.tcp_mem = 786432 1048576 26777216
 net.ipv4.udp_rmem_min = 16384
 net.ipv4.udp_wmem_min = 16384
 
 # ---- 高延迟链路优化 ----
+# ★ 不开 tcp_fastopen=3（跨境中间箱对 TFO 兼容差）
 net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_mtu_probing = 1
 net.ipv4.tcp_window_scaling = 1
 net.ipv4.tcp_sack = 1
-net.ipv4.tcp_fastopen = 3
 net.ipv4.tcp_notsent_lowat = 16384
 
 # ---- 代理场景多并发 ----

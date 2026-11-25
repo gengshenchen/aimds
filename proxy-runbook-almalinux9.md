@@ -15,16 +15,18 @@ scp -P <port> scripts/vps-bootstrap-almalinux9.sh root@<vps-ip>:/root/
 ssh -p <port> root@<vps-ip>
 
 bash /root/vps-bootstrap-almalinux9.sh check       # 只读体检，不改任何东西
-bash /root/vps-bootstrap-almalinux9.sh node        # 主手册 1.1-1.5 装 Xray + REALITY
-bash /root/vps-bootstrap-almalinux9.sh tune        # 主手册 6.3 BBR + TCP 缓冲区
+bash /root/vps-bootstrap-almalinux9.sh node        # 主手册 1.1-1.5 装 Xray + REALITY (防封加固版)
+bash /root/vps-bootstrap-almalinux9.sh rotate      # ★换 IP / 换 SNI / 凭据泄露时强制全套轮换
+bash /root/vps-bootstrap-almalinux9.sh tune        # 主手册 6.3 BBR + TCP 缓冲区 (已去 tcp_mem/TFO)
 SSH_PUBKEY='ssh-ed25519 AAAA...' \
   bash /root/vps-bootstrap-almalinux9.sh secure    # 主手册 1.7 firewalld/fail2ban/公钥/更新
-bash /root/vps-bootstrap-almalinux9.sh selftest    # 主手册 1.6 本机自测，要 google:200
-bash /root/vps-bootstrap-almalinux9.sh link        # 输出 vless:// 链接
-bash /root/vps-bootstrap-almalinux9.sh harden-ssh  # ★另开终端确认密钥可登后才跑：关密码登录
+bash /root/vps-bootstrap-almalinux9.sh selftest    # 主手册 1.6 本机自测，要 google:200 + 回国拦截 000
+bash /root/vps-bootstrap-almalinux9.sh link        # 输出 vless:// 链接（也会生成 /root/show-link.sh）
+NEW_SSH_PORT=28422 \
+  bash /root/vps-bootstrap-almalinux9.sh harden-ssh  # ★另开终端确认密钥可登后才跑：关密码登录并改离 22 端口
 ```
 
-可用环境变量：`SNI=` `PORT=` `NODE_NAME=` `SSH_PUBKEY=`。
+可用环境变量：`SNI=`（默认 `mirrors.ocf.berkeley.edu`，**禁用 `www.tesla.com` 等 Akamai/CF 大站**）`PORT=` `NODE_NAME=` `SSH_PUBKEY=` `NEW_SSH_PORT=`。
 
 设计要点：
 - **私钥永不回显**，只写入 `/root/reality-creds.txt`（600）。`link` 只拼公开参数（UUID/PublicKey/shortId）。
@@ -37,7 +39,7 @@ bash /root/vps-bootstrap-almalinux9.sh harden-ssh  # ★另开终端确认密钥
 
 **这是本篇最值得记的一条，且不是 EL9 特有——凡是用官方 systemd 单元的发行版都会中，包括 Ubuntu。**
 
-官方安装脚本生成的 `/etc/systemd/system/xray.service` 里跑的是 **`User=nobody`**。如果按「配置含私钥就该锁死」的直觉给：
+官方安装脚本生成的 `/etc/systemd/system/xray.service` 里跑的是非 root 用户（**Xray v26.11+ 已改为 `User=xray`，旧版为 `User=nobody`**）。如果按「配置含私钥就该锁死」的直觉给：
 
 ```bash
 chmod 600 /usr/local/etc/xray/config.json   # ← root:root 独占，nobody 读不到
@@ -170,21 +172,24 @@ systemctl reset-failed fw-deadman
 
 主手册用 `sed -i` 改 `/etc/ssh/sshd_config`。**EL9 上这可能不生效**——`/etc/ssh/sshd_config.d/50-redhat.conf` 和 cloud-init 的 drop-in 会覆盖主文件里的设置（sshd 取**第一次**出现的值，而主文件顶部通常就 `Include sshd_config.d/*.conf`）。
 
-正确做法是写一个高序号 drop-in：
+正确做法是写一个**最前序号** drop-in（**★ 必须是 `00-hardening.conf` 而非 `99-`**：OpenSSH 按字典序读取且**首个匹配生效**，`00-` 才能压过 `50-redhat.conf`）：
 
 ```bash
 mkdir -p /etc/ssh/sshd_config.d
-cat > /etc/ssh/sshd_config.d/99-hardening.conf <<'EOF'
+cat > /etc/ssh/sshd_config.d/00-hardening.conf <<'EOF'
+Port 28422
 PasswordAuthentication no
 PermitRootLogin prohibit-password
 KbdInteractiveAuthentication no
 MaxAuthTries 3
 EOF
+chmod 600 /etc/ssh/sshd_config.d/00-hardening.conf
 
 sshd -t || echo "语法错误，别重启！"     # ★ 先校验
 systemctl restart sshd
-sshd -T | grep -iE '^(passwordauthentication|permitrootlogin)'   # 看实际生效值
+sshd -T | grep -iE '^(port|passwordauthentication|permitrootlogin)'   # 看实际生效值
 ```
+*(若主文件 `/etc/ssh/sshd_config` 里有未注释的 `Port 22`，需同步注释掉，因为 `Port` 是多值项，否则会同时监听 22 和新端口。)*
 
 **★ 执行前务必**：确认 `authorized_keys` 非空、且已用密钥成功登录过一次。**执行后别关当前会话**，先另开终端验证。
 
@@ -239,7 +244,8 @@ semanage port -a -t ssh_port_t -p tcp <新端口> 2>/dev/null || true
 | `fail2ban` 启动即失败 | `backend = systemd` 缺 `python3-systemd` | `dnf install python3-systemd` |
 | `Can't use stand-alone options with other options.` 加固中断 | `--permanent` 和 `--set-default-zone` 连用 | 去掉 `--permanent`。见第 3 节 |
 | firewalld 状态是 `enabled` 但 `inactive`，重启后节点会被挡死 | 加固脚本中途报错退出，留下半成品状态 | 补完端口放行再 `enable --now`；重跑幂等脚本自愈 |
-| `sed -i` 改了 `sshd_config` 但 `sshd -T` 显示没生效 | `sshd_config.d/50-redhat.conf` 覆盖了主文件 | 改用 `99-hardening.conf` drop-in。见第 5 节 |
+| `sed -i` 改了 `sshd_config` 或写 `99-hardening.conf` 但 `sshd -T` 没生效 | `sshd_config.d/50-redhat.conf` 排在前面先匹配，OpenSSH 首个匹配生效 | 改用 **`00-hardening.conf`** 排在最前；若改端口，主文件里的 `Port 22` 也要注释。见第 5 节 |
+| 1G 内存小鸡高并发 OOM 杀掉 xray | 旧模板写了 `net.ipv4.tcp_mem = 786432 1048576 26777216`（单位是 **4KB 页**，不是字节，相当于 3GB~102GB） | 删掉 `tcp_mem` 交给内核按内存自动计算；顺便删掉 `tcp_fastopen = 3` |
 | `getenforce: command not found` | 该镜像没启用 SELinux（搬瓦工 EL9 如此） | 正常，`restorecon`/`semanage` 加 `|| true` 跳过 |
 | 脚本里取 SSH 端口得到 `"22\n22"`，拼进 `--add-port` 报错 | `sshd -T \| awk '...{exit}'` 在 `pipefail` 下让 `sshd -T` 吃 SIGPIPE → 管道判失败 → 兜底 `echo 22` 也执行 | 别在管道里用 `awk ... exit`；取首行后用 `${var%%$'\n'*}` |
 
@@ -247,8 +253,8 @@ semanage port -a -t ssh_port_t -p tcp <新端口> 2>/dev/null || true
 
 ## 关键取值备忘
 
-- 服务用户 **`nobody`**（`awk -F= '/^User=/' /etc/systemd/system/xray.service` 确认），`config.json` 必须 `640 root:nobody`。
-- 防火墙是 **firewalld**，只放 SSH + 443；`--set-default-zone` 不带 `--permanent`。
-- SSH 加固走 `/etc/ssh/sshd_config.d/99-hardening.conf`，不改主文件。
-- EL9 出厂已 `bbr`+`fq`，**只需调缓冲区**（`rmem_max` 212992 → 32MB）。
-- 凭据（UUID/privateKey/shortId）**每台机重新生成**，切勿跨机复用——与主手册一致。
+- 服务用户动态读取（**v26.11+ 为 `xray`，旧版为 `nobody`**，`awk -F= '/^User=/' /etc/systemd/system/xray.service` 确认），`config.json` 必须 `640 root:<svc_user>`。
+- 防火墙是 **firewalld**，只放自定义 SSH 端口（如 `28422`）+ `443`；`--set-default-zone` 不带 `--permanent`。
+- SSH 加固走 `/etc/ssh/sshd_config.d/00-hardening.conf`（必须排在 `50-redhat.conf` 之前），不改主文件。
+- EL9 出厂已 `bbr`+`fq`，**只需调缓冲区**（`rmem_max` 212992 → 32MB），**绝不乱写 `tcp_mem`**。
+- 伪装目标禁用 `www.tesla.com`/`www.icloud.com` 等 Akamai/CF 大站，用 `mirrors.ocf.berkeley.edu` 等实测 200 的非大 CDN 独立站；换 IP 必须跑 `rotate` 全套轮换凭据。
