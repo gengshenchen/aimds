@@ -22,11 +22,13 @@ SSH_PUBKEY='ssh-ed25519 AAAA...' \
   bash /root/vps-bootstrap-almalinux9.sh secure    # 主手册 1.7 firewalld/fail2ban/公钥/更新
 bash /root/vps-bootstrap-almalinux9.sh selftest    # 主手册 1.6 本机自测，要 google:200 + 回国拦截 000
 bash /root/vps-bootstrap-almalinux9.sh link        # 输出 vless:// 链接（也会生成 /root/show-link.sh）
+CF_HOST=sync.example.com \
+  bash /root/vps-bootstrap-almalinux9.sh cf-backup # ★可选：加 Cloudflare CDN 备用通道（独立 xray@cf, 8443 仅放行 CF 回源 IP）
 NEW_SSH_PORT=28422 \
   bash /root/vps-bootstrap-almalinux9.sh harden-ssh  # ★另开终端确认密钥可登后才跑：关密码登录并改离 22 端口
 ```
 
-可用环境变量：`SNI=`（默认 `mirrors.ocf.berkeley.edu`，**禁用 `www.tesla.com` 等 Akamai/CF 大站**）`PORT=` `NODE_NAME=` `SSH_PUBKEY=` `NEW_SSH_PORT=`。
+可用环境变量：`SNI=`（默认 `mirrors.ocf.berkeley.edu`，**禁用 `www.tesla.com` 等 Akamai/CF 大站**）`PORT=` `NODE_NAME=` `SSH_PUBKEY=` `NEW_SSH_PORT=` `CF_HOST=` `CF_ORIGIN_PORT=`（默认 `8443`）。
 
 设计要点：
 - **私钥永不回显**，只写入 `/root/reality-creds.txt`（600）。`link` 只拼公开参数（UUID/PublicKey/shortId）。
@@ -235,7 +237,41 @@ semanage port -a -t ssh_port_t -p tcp <新端口> 2>/dev/null || true
 
 ---
 
-## 7. 排错速查表（EL9 专属）
+## 7. ★ Cloudflare CDN 永不失联备用通道（独立 `xray@cf` + 8443 白名单）
+
+> **场景**：IPv4 被 GFW 封禁但不想花钱换 IP（或静默等解封期间仍要使用独享美区 IP 跑 Gemini/Claude）。
+> **架构**：主通道 `xray.service`（`443` REALITY）与备用通道 `xray@cf.service`（`8443` VLESS+WS+TLS）**完全隔离**。主通道被封时可 `systemctl stop xray` 让 443 静默等解封，同时 `xray@cf` 独立对外通过 Cloudflare 边缘节点回源工作。
+
+### 7.1 Cloudflare 后台 4 步配置（免费计划，无需绑卡）
+1. **接入域名**（推荐海外注册商买 `.com` 或 6~9 位纯数字 `.xyz`，避开国内注册商）→ 改 NS 到 Cloudflare → 若注册商默认开了 **DNSSEC** 导致切换后报 `DNSSEC validation failure`，先在注册商后台**关掉 DNSSEC**。
+2. **添加 A 记录**（`DNS -> Records`）：`Name=<子域前缀>`（如 `sync`）、`IPv4=<VPS_IP>`、**开启小黄云（Proxied）**；删掉原注册商自带的停放广告页根域名记录（可改用免费 **Cloudflare Pages** 挂极简静态页）。
+3. **SSL/TLS 模式**：改为 **`Full (strict)`**；并在 `SSL/TLS -> Origin Server` 签发一张 **15 年通配符 Origin CA 证书**（免 80 端口与 `acme.sh` 续签），把证书和私钥保存到 VPS 的 `/usr/local/etc/xray/certs/origin.pem` 和 `origin.key`。
+4. **Origin Rule 回源端口重写**（`Rules -> Origin Rules`）：匹配 `Hostname equals <子域名>` → `Destination Port` 选 `Rewrite to` **`8443`**（客户端连 CF 边缘仍走标准 `443`）。
+
+### 7.2 服务端一键部署与防火墙白名单
+官方 Xray 安装包已自带 `/etc/systemd/system/xray@.service`（自动读取 `/usr/local/etc/xray/%i.json`）。直接运行一键脚本子命令：
+```bash
+CF_HOST=sync.example.com bash /root/vps-bootstrap-almalinux9.sh cf-backup
+```
+它会自动完成：
+- 从 Cloudflare 官方拉取全部回源 IPv4/IPv6 段，写入 `firewalld` 的 `cloudflare-v4` / `cloudflare-v6` ipset，**仅允许 Cloudflare 回源 IP 访问 `8443/tcp`**（对公网和 GFW 完全隐身，绝不向 `0.0.0.0/0` 暴露 8443）；
+- 生成独立 UUID 与随机 WebSocket 路径，写入 `/usr/local/etc/xray/cf.json`（含 `geoip:cn` / `geoip:private` / `bittorrent` 拦截）与 `/root/show-cf-link.sh`；
+- 放入 Origin CA 证书后执行 `chown root:xray && chmod 640` 并 `systemctl enable --now xray@cf`。
+
+### 7.3 取链接与 CF 优选 IP 提速
+```bash
+# 默认链接（经 Cloudflare 自动分配边缘节点）
+/root/show-cf-link.sh
+
+# CF 优选 IP 提速（保留 sni/host=<子域名>，只替换客户端连接地址）：
+# 在国内直连网络下用 XIU2/CloudflareSpeedTest 测出对你宽带最快的 CF IP 传入即可
+/root/show-cf-link.sh <优选CF_IP>
+```
+> 注：选用 `VLESS + WebSocket + TLS` 是为了 100% 兼容老版本 `v2rayA 2.2.5.8` 及全平台客户端；若所有客户端均已升级到支持 `XHTTP` 的新版，可将 `network` 升级为 `xhttp`。
+
+---
+
+## 8. 排错速查表（EL9 专属）
 
 | 症状 | 原因 | 解法 |
 |---|---|---|

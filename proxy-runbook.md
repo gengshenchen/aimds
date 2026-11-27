@@ -169,6 +169,8 @@ apt-get update && apt-get -y upgrade
 4. **换 IP 前必做清洗，绝不原配置直接上新 IP**：搬瓦工付费换 IP 保留磁盘数据，若不换 SNI 和凭据等于把触发条件原样带到新 IP。换 IP 前应先停服、跑 `rotate` 轮换全套凭据与新 SNI、SSH 迁离 22 端口并关密码登录、绝不把曾指向被封 IP 的旧域名指到新 IP。
 5. **等自动解封必须彻底静默**：被封后若选择不花钱换 IP 而等解封，**务必同时在 VPS 上 `systemctl stop xray` + 在所有客户端断开该节点 + 确认看门狗已停**，让 443 端口彻底静默，避免主动探测或重连流量持续刷新封锁状态。
 6. **避免从搬瓦工 VPS 做网段端口扫描**：不要在搬瓦工上拿 `RealiTLScanner` 扫 `/24` 或 `/22`，易触发商家防扫描风控；直接针对少量候选域名做单次礼貌 `curl`/`openssl` 验货即可。
+7. **双通道防失联兜底（Cloudflare CDN 备用）**：不要把鸡蛋全押在单条裸 IP 上。用自有域名在独立实例 `xray@cf.service` 上配一条 `8443` 端口的 **VLESS + WS + TLS**（防火墙仅放行 Cloudflare 官方回源 IP 段 + CF Origin Rule 443→8443 + 15 年 Origin CA 证书），平时主用 443 REALITY 高速直连，IP 被封期间立刻切 CF 备用通道继续使用独享美区 IP，主通道 `443` 静默等解封。完整部署与 CF 优选 IP 提速见 [proxy-runbook-almalinux9.md](proxy-runbook-almalinux9.md) 第 7 节。
+8. **警惕「测错端口」与「客户端老内核」误判**：`itdog.cn` 的 TCPing 默认测 `80` 端口（防火墙已 DROP，海内外必超时）；测节点须带 `:443`，443 停服等解封时改测自定义 SSH 端口（如 `:28422`）判断国内是否变绿。本机升级 `xray` 前务必先做 `run -test` 并准备自动回滚脚本，防升级断网。
 
 ---
 

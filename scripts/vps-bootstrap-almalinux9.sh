@@ -14,10 +14,11 @@
 #   bash vps-bootstrap-almalinux9.sh secure      # 手册 1.7 firewalld/fail2ban/装公钥/更新
 #   bash vps-bootstrap-almalinux9.sh selftest    # 手册 1.6 服务端本机自测 (含 google:200 + 回国拦截验证)
 #   bash vps-bootstrap-almalinux9.sh link        # 重印 vless:// 链接
+#   bash vps-bootstrap-almalinux9.sh cf-backup   # ★可选: 加 Cloudflare CDN 备用通道 (独立 xray@cf, 8443 仅放行 CF IP)
 #   bash vps-bootstrap-almalinux9.sh harden-ssh  # ★另开终端确认密钥可登后才跑: 关密码登录 (可选改端口)
 #   bash vps-bootstrap-almalinux9.sh all         # check+node+tune+secure+selftest+link
 #
-# 环境变量: SNI= PORT= NODE_NAME= SSH_PUBKEY= NEW_SSH_PORT=
+# 环境变量: SNI= PORT= NODE_NAME= SSH_PUBKEY= NEW_SSH_PORT= CF_HOST= CF_ORIGIN_PORT=
 set -euo pipefail
 
 # ★ 切勿使用 www.tesla.com / www.icloud.com 等 Akamai/Cloudflare 大 CDN 或全网默认 SNI:
@@ -28,6 +29,8 @@ PORT="${PORT:-443}"
 NODE_NAME="${NODE_NAME:-BWG-GIA}"
 SSH_PUBKEY="${SSH_PUBKEY:-}"
 NEW_SSH_PORT="${NEW_SSH_PORT:-}"
+CF_HOST="${CF_HOST:-}"
+CF_ORIGIN_PORT="${CF_ORIGIN_PORT:-8443}"
 XRAY=/usr/local/bin/xray
 CFG=/usr/local/etc/xray/config.json
 CREDS=/root/reality-creds.txt
@@ -454,6 +457,121 @@ do_link() {    # 手册 1.5
 }
 
 
+do_cf_backup() {  # EL9 手册第 7 节: 独立 xray@cf 备用通道 (8443 仅放行 Cloudflare 回源 IP)
+  [[ -n $CF_HOST ]] || die "请传入 CF_HOST=sync.yourdomain.com"
+  [[ -x $XRAY ]] || die "未找到 $XRAY, 先跑 node 装 Xray"
+
+  say "配置 firewalld Cloudflare 官方回源 IP 白名单 (仅放行 ${CF_ORIGIN_PORT}/tcp)"
+  local cf_v4 cf_v6
+  cf_v4=$(curl -fsSL --max-time 10 https://www.cloudflare.com/ips-v4) || die "拉取 CF IPv4 段失败"
+  cf_v6=$(curl -fsSL --max-time 10 https://www.cloudflare.com/ips-v6) || die "拉取 CF IPv6 段失败"
+  firewall-cmd --permanent --get-ipsets | grep -qw cloudflare-v4 || \
+    firewall-cmd --permanent --new-ipset=cloudflare-v4 --type=hash:net --option=family=inet >/dev/null
+  firewall-cmd --permanent --get-ipsets | grep -qw cloudflare-v6 || \
+    firewall-cmd --permanent --new-ipset=cloudflare-v6 --type=hash:net --option=family=inet6 >/dev/null
+  for cidr in $cf_v4; do firewall-cmd --permanent --ipset=cloudflare-v4 --add-entry="$cidr" >/dev/null; done
+  for cidr in $cf_v6; do firewall-cmd --permanent --ipset=cloudflare-v6 --add-entry="$cidr" >/dev/null; done
+  firewall-cmd --permanent --add-rich-rule="rule family=\"ipv4\" source ipset=\"cloudflare-v4\" port port=\"${CF_ORIGIN_PORT}\" protocol=\"tcp\" accept" >/dev/null
+  firewall-cmd --permanent --add-rich-rule="rule family=\"ipv6\" source ipset=\"cloudflare-v6\" port port=\"${CF_ORIGIN_PORT}\" protocol=\"tcp\" accept" >/dev/null
+  firewall-cmd --reload >/dev/null
+  ok "firewalld 已仅对 CF 回源段放行 ${CF_ORIGIN_PORT}/tcp (公网不可见)"
+
+  local svc_user cf_creds cf_cfg cf_cert_dir cf_uuid cf_path
+  svc_user=$(awk -F= '/^User=/{print $2; exit}' /etc/systemd/system/xray@.service 2>/dev/null || echo xray)
+  svc_user=${svc_user:-xray}
+  cf_creds=/root/cf-creds.txt
+  cf_cfg=/usr/local/etc/xray/cf.json
+  cf_cert_dir=/usr/local/etc/xray/certs
+
+  mkdir -p "$cf_cert_dir"
+  chown "root:${svc_user}" "$cf_cert_dir"
+  chmod 750 "$cf_cert_dir"
+
+  if [[ -f "$cf_creds" ]]; then
+    source "$cf_creds"
+    cf_uuid="$CF_UUID"; cf_path="$CF_PATH"
+    warn "已存在 $cf_creds, 复用 CF 凭据 (host=${CF_HOST})"
+  else
+    cf_uuid=$($XRAY uuid)
+    cf_path="/ws-$(openssl rand -hex 6)"
+    { echo "# $(date -Is) Cloudflare CDN backup channel"
+      echo "CF_HOST=${CF_HOST}"
+      echo "CF_UUID=${cf_uuid}"
+      echo "CF_PATH=${cf_path}"
+      echo "CF_ORIGIN_PORT=${CF_ORIGIN_PORT}"; } > "$cf_creds"
+    chmod 600 "$cf_creds"
+    ok "已生成独立 CF 凭据 (存 $cf_creds, path=${cf_path})"
+  fi
+
+  cat > "$cf_cfg" <<EOF
+{
+  "log": { "loglevel": "warning" },
+  "inbounds": [{
+    "listen": "::",
+    "port": ${CF_ORIGIN_PORT},
+    "protocol": "vless",
+    "settings": {
+      "clients": [{ "id": "${cf_uuid}" }],
+      "decryption": "none"
+    },
+    "streamSettings": {
+      "network": "ws",
+      "security": "tls",
+      "tlsSettings": {
+        "alpn": ["http/1.1"],
+        "minVersion": "1.2",
+        "certificates": [{
+          "certificateFile": "${cf_cert_dir}/origin.pem",
+          "keyFile": "${cf_cert_dir}/origin.key"
+        }]
+      },
+      "wsSettings": { "path": "${cf_path}", "host": "${CF_HOST}" }
+    },
+    "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"] }
+  }],
+  "outbounds": [
+    { "protocol": "freedom", "tag": "direct" },
+    { "protocol": "blackhole", "tag": "block" }
+  ],
+  "routing": {
+    "domainStrategy": "IPIfNonMatch",
+    "rules": [
+      { "type": "field", "ip": ["geoip:private", "geoip:cn"], "outboundTag": "block" },
+      { "type": "field", "protocol": ["bittorrent"], "outboundTag": "block" }
+    ]
+  }
+}
+EOF
+  chown "root:${svc_user}" "$cf_cfg"
+  chmod 640 "$cf_cfg"
+
+  cat > /root/show-cf-link.sh <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+source /root/cf-creds.txt
+ADDR="${1:-$CF_HOST}"
+ENC_PATH=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$CF_PATH")
+LINK="vless://${CF_UUID}@${ADDR}:443?encryption=none&security=tls&sni=${CF_HOST}&fp=chrome&type=ws&host=${CF_HOST}&path=${ENC_PATH}#BWG-CF-BACKUP"
+echo "$LINK"
+command -v qrencode >/dev/null 2>&1 && { echo; qrencode -t ANSIUTF8 "$LINK"; } || true
+SH
+  chmod 700 /root/show-cf-link.sh
+
+  if [[ -s "${cf_cert_dir}/origin.pem" && -s "${cf_cert_dir}/origin.key" ]]; then
+    chown "root:${svc_user}" "${cf_cert_dir}/origin.pem" "${cf_cert_dir}/origin.key"
+    chmod 640 "${cf_cert_dir}/origin.pem" "${cf_cert_dir}/origin.key"
+    $XRAY run -test -config "$cf_cfg" | tail -3 | grep -q 'Configuration OK' || die "cf.json 校验失败"
+    systemctl enable --now xray@cf
+    systemctl restart xray@cf
+    sleep 2
+    [[ $(systemctl is-active xray@cf) == active ]] && ok "xray@cf active (:${CF_ORIGIN_PORT})" || die "xray@cf 启动失败"
+    echo "   领链接: /root/show-cf-link.sh [可选优选CF_IP]"
+  else
+    warn "请先将 Cloudflare 15 年 Origin CA 证书写入 ${cf_cert_dir}/origin.pem 和 origin.key (640 root:${svc_user}), 再重跑本命令启动 xray@cf"
+  fi
+}
+
+
 case "${1:-help}" in
   check)      do_check ;;
   node)       do_node ;;
@@ -462,9 +580,10 @@ case "${1:-help}" in
   secure)     do_secure ;;
   selftest)   do_selftest ;;
   link)       do_link ;;
+  cf-backup)  do_cf_backup ;;
   harden-ssh) do_harden_ssh ;;
   all)        do_check; do_node; do_tune; do_secure; do_selftest; do_link
               say "完成"
               echo "   下一步: ①客户端导入上面链接并实测 ②确认密钥登录 OK 后跑 'NEW_SSH_PORT=28422 bash $0 harden-ssh'" ;;
-  *)          sed -n '2,26p' "$0" ;;
+  *)          sed -n '2,27p' "$0" ;;
 esac
